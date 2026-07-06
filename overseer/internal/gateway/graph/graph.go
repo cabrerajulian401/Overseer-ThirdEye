@@ -4,6 +4,7 @@
 package graph
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -109,6 +110,90 @@ func (c *Client) fetchPage(ctx context.Context, accessToken, pageURL string) (*l
 		return nil, fmt.Errorf("graph: decode response: %w", err)
 	}
 	return &page, nil
+}
+
+// subscriptionRequest mirrors Graph's POST /subscriptions body.
+type subscriptionRequest struct {
+	ChangeType         string `json:"changeType"`
+	NotificationURL    string `json:"notificationUrl"`
+	Resource           string `json:"resource"`
+	ExpirationDateTime string `json:"expirationDateTime"`
+	ClientState        string `json:"clientState"`
+}
+
+type subscriptionResponse struct {
+	ID string `json:"id"`
+}
+
+// CreateSubscription registers a change-notification webhook for new inbox
+// messages and returns Microsoft's subscription id. Graph validates
+// notificationURL synchronously during this call (the validationToken echo).
+func (c *Client) CreateSubscription(ctx context.Context, accessToken, notificationURL, clientState string, expires time.Time) (string, error) {
+	payload, err := json.Marshal(subscriptionRequest{
+		ChangeType:         "created",
+		NotificationURL:    notificationURL,
+		Resource:           "/me/messages",
+		ExpirationDateTime: expires.UTC().Format(time.RFC3339),
+		ClientState:        clientState,
+	})
+	if err != nil {
+		return "", fmt.Errorf("graph: marshal subscription: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/subscriptions", bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("graph: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("graph: create subscription: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("graph: create subscription: status %d: %s", resp.StatusCode, body)
+	}
+
+	var out subscriptionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("graph: decode subscription: %w", err)
+	}
+	return out.ID, nil
+}
+
+// RenewSubscription pushes a subscription's expiry forward (~3-day max
+// lifetime per Graph; the renewal worker calls this before expiry).
+func (c *Client) RenewSubscription(ctx context.Context, accessToken, subscriptionID string, expires time.Time) error {
+	payload, err := json.Marshal(map[string]string{
+		"expirationDateTime": expires.UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return fmt.Errorf("graph: marshal renewal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch,
+		c.BaseURL+"/subscriptions/"+url.PathEscape(subscriptionID), bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("graph: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("graph: renew subscription: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("graph: renew subscription: status %d: %s", resp.StatusCode, body)
+	}
+	return nil
 }
 
 // GetMessage fetches one message by Graph id — the webhook job's read path
