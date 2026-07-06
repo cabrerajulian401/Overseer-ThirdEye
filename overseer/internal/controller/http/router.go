@@ -16,6 +16,7 @@ type WSHandler interface {
 
 type RouterDeps struct {
 	Resolver UserResolver
+	Tokens   TokenSink // optional: caches Graph tokens for background jobs
 	Orders   *OrdersController
 	WS       WSHandler
 	Log      *slog.Logger
@@ -37,7 +38,7 @@ func NewRouter(d RouterDeps) *echo.Echo {
 		}))
 	}
 
-	auth := AuthMiddleware(d.Resolver)
+	auth := AuthMiddleware(d.Resolver, d.Tokens)
 
 	e.GET("/orders", d.Orders.GetOrders, auth)
 	e.POST("/sync", d.Orders.PostSync, auth)
