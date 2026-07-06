@@ -15,11 +15,13 @@ type WSHandler interface {
 }
 
 type RouterDeps struct {
-	Resolver UserResolver
-	Tokens   TokenSink // optional: caches Graph tokens for background jobs
-	Orders   *OrdersController
-	WS       WSHandler
-	Log      *slog.Logger
+	Resolver      UserResolver
+	Tokens        TokenSink // optional: caches Graph tokens for background jobs
+	Orders        *OrdersController
+	Subscriptions *SubscriptionsController
+	Webhooks      *WebhooksController
+	WS            WSHandler
+	Log           *slog.Logger
 }
 
 // NewRouter assembles the Echo app. E2E tests build the same router with
@@ -43,6 +45,13 @@ func NewRouter(d RouterDeps) *echo.Echo {
 	e.GET("/orders", d.Orders.GetOrders, auth)
 	e.POST("/sync", d.Orders.PostSync, auth)
 	e.GET("/ws", func(c echo.Context) error { return d.WS.Handler(c) }, auth)
+	if d.Subscriptions != nil {
+		e.POST("/subscriptions", d.Subscriptions.PostSubscriptions, auth)
+	}
+	if d.Webhooks != nil {
+		// No auth middleware: Graph POSTs here directly; clientState is the check.
+		e.POST("/webhooks/graph", d.Webhooks.PostGraph)
+	}
 
 	return e
 }

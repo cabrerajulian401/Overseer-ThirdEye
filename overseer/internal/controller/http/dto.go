@@ -38,6 +38,25 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+// graphNotification mirrors one entry of Graph's change-notification POST.
+type graphNotification struct {
+	SubscriptionID string `json:"subscriptionId"`
+	ChangeType     string `json:"changeType"`
+	ClientState    string `json:"clientState"`
+	ResourceData   struct {
+		ID string `json:"id"` // Graph message id
+	} `json:"resourceData"`
+}
+
+type graphNotificationPayload struct {
+	Value []graphNotification `json:"value"`
+}
+
+type subscriptionCreatedResponse struct {
+	SubscriptionID string `json:"subscriptionId"`
+	ExpiresAt      string `json:"expiresAt"`
+}
+
 func toOrderDTO(o entity.Order) orderDTO {
 	return orderDTO{
 		ID:              o.ID.String(),
