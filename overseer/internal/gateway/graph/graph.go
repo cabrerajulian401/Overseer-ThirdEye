@@ -111,6 +111,38 @@ func (c *Client) fetchPage(ctx context.Context, accessToken, pageURL string) (*l
 	return &page, nil
 }
 
+// GetMessage fetches one message by Graph id — the webhook job's read path
+// (spec: gateway/graph/GetMessage).
+func (c *Client) GetMessage(ctx context.Context, accessToken, messageID string) (entity.EmailMessage, error) {
+	q := url.Values{}
+	q.Set("$select", "id,conversationId,conversationIndex,from,subject,body,bodyPreview,webLink,createdDateTime")
+	reqURL := c.BaseURL + "/me/messages/" + url.PathEscape(messageID) + "?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return entity.EmailMessage{}, fmt.Errorf("graph: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return entity.EmailMessage{}, fmt.Errorf("graph: get message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return entity.EmailMessage{}, fmt.Errorf("graph: get message: status %d: %s", resp.StatusCode, body)
+	}
+
+	var gm graphMessage
+	if err := json.NewDecoder(resp.Body).Decode(&gm); err != nil {
+		return entity.EmailMessage{}, fmt.Errorf("graph: decode message: %w", err)
+	}
+	return toEntity(gm), nil
+}
+
 func toEntity(gm graphMessage) entity.EmailMessage {
 	created, _ := time.Parse(time.RFC3339, gm.CreatedDateTime)
 	return entity.EmailMessage{
