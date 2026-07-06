@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -24,6 +25,31 @@ type wireEvent struct {
 type syncCompletedDTO struct {
 	SyncID         string `json:"syncId"`
 	OrdersUpserted int    `json:"ordersUpserted"`
+}
+
+// orderDTO is order.updated's wire shape — same camelCase fields the HTTP
+// layer serves, mapped here because each edge owns its own DTOs.
+type orderDTO struct {
+	ID              string  `json:"id"`
+	ConversationID  string  `json:"conversationId"`
+	CompanyName     string  `json:"companyName"`
+	EmailAddress    string  `json:"emailAddress,omitempty"`
+	OrderID         int     `json:"orderId"`
+	EmailURL        string  `json:"emailUrl,omitempty"`
+	Status          string  `json:"status"`
+	DateCreated     string  `json:"dateCreated"`
+	OriginalEstDate *string `json:"originalEstDate"`
+	CurrentEstDate  *string `json:"currentEstDate"`
+	LastMessenger   string  `json:"lastMessenger,omitempty"`
+	SupportingQuote string  `json:"supportingQuote,omitempty"`
+}
+
+func dateString(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.Format("2006-01-02")
+	return &s
 }
 
 type Hub struct {
@@ -103,6 +129,21 @@ func toDTO(data any) any {
 	switch d := data.(type) {
 	case entity.SyncCompleted:
 		return syncCompletedDTO{SyncID: d.SyncID.String(), OrdersUpserted: d.OrdersUpserted}
+	case entity.Order:
+		return orderDTO{
+			ID:              d.ID.String(),
+			ConversationID:  d.ConversationID,
+			CompanyName:     d.CompanyName,
+			EmailAddress:    d.EmailAddress,
+			OrderID:         d.OrderID,
+			EmailURL:        d.EmailURL,
+			Status:          string(d.Status),
+			DateCreated:     d.CreatedAt.UTC().Format(time.RFC3339),
+			OriginalEstDate: dateString(d.OriginalEstDate),
+			CurrentEstDate:  dateString(d.CurrentEstDate),
+			LastMessenger:   d.LastMessenger,
+			SupportingQuote: d.SupportingQuote,
+		}
 	default:
 		return d
 	}
