@@ -80,20 +80,22 @@ func (r *Orders) List(ctx context.Context, userID uuid.UUID, status *entity.Orde
 	return scanOrders(rows)
 }
 
-func (r *Orders) GetByConversation(ctx context.Context, userID string, conversationID string) (entity.Order, error) {
+// GetByConversation is the webhook-job lookup (idx_orders_conversation):
+// found=false, not an error, when the conversation has no order row yet.
+func (r *Orders) GetByConversation(ctx context.Context, userID uuid.UUID, conversationID string) (entity.Order, bool, error) {
 	rows, err := r.db.Query(ctx, getOrderByConversationSQL, userID, conversationID)
 	if err != nil {
-		return entity.Order{}, fmt.Errorf("get order by conversation: %w", err)
+		return entity.Order{}, false, fmt.Errorf("get order by conversation: %w", err)
 	}
 	defer rows.Close()
 	out, err := scanOrders(rows)
 	if err != nil {
-		return entity.Order{}, err
+		return entity.Order{}, false, err
 	}
 	if len(out) == 0 {
-		return entity.Order{}, pgx.ErrNoRows
+		return entity.Order{}, false, nil
 	}
-	return out[0], nil
+	return out[0], true, nil
 }
 
 func scanOrders(rows pgx.Rows) ([]entity.Order, error) {

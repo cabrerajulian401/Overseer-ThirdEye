@@ -6,6 +6,7 @@ package testutil
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -23,6 +24,26 @@ type FakeGraph struct {
 
 	TokensSeen []string
 	SincesSeen []time.Time
+
+	// GetMessage support: message id → message. GetErr forces a failure.
+	MessagesByID map[string]entity.EmailMessage
+	GetErr       error
+	GetCalls     []string
+
+	// Subscription support.
+	CreatedSubID string
+	CreateErr    error
+	CreateCalls  []SubscriptionCall
+	RenewErr     error
+	RenewedIDs   []string
+}
+
+// SubscriptionCall records one CreateSubscription invocation.
+type SubscriptionCall struct {
+	Token           string
+	NotificationURL string
+	ClientState     string
+	Expires         time.Time
 }
 
 func (f *FakeGraph) ListMessages(_ context.Context, accessToken string, since time.Time) ([]entity.EmailMessage, error) {
@@ -32,6 +53,35 @@ func (f *FakeGraph) ListMessages(_ context.Context, accessToken string, since ti
 		return nil, f.Err
 	}
 	return f.Messages, nil
+}
+
+func (f *FakeGraph) GetMessage(_ context.Context, accessToken, messageID string) (entity.EmailMessage, error) {
+	f.TokensSeen = append(f.TokensSeen, accessToken)
+	f.GetCalls = append(f.GetCalls, messageID)
+	if f.GetErr != nil {
+		return entity.EmailMessage{}, f.GetErr
+	}
+	msg, ok := f.MessagesByID[messageID]
+	if !ok {
+		return entity.EmailMessage{}, fmt.Errorf("fake graph: no message %q", messageID)
+	}
+	return msg, nil
+}
+
+func (f *FakeGraph) CreateSubscription(_ context.Context, accessToken, notificationURL, clientState string, expires time.Time) (string, error) {
+	f.CreateCalls = append(f.CreateCalls, SubscriptionCall{Token: accessToken, NotificationURL: notificationURL, ClientState: clientState, Expires: expires})
+	if f.CreateErr != nil {
+		return "", f.CreateErr
+	}
+	return f.CreatedSubID, nil
+}
+
+func (f *FakeGraph) RenewSubscription(_ context.Context, _ string, subscriptionID string, _ time.Time) error {
+	if f.RenewErr != nil {
+		return f.RenewErr
+	}
+	f.RenewedIDs = append(f.RenewedIDs, subscriptionID)
+	return nil
 }
 
 // --- FakeLLM -----------------------------------------------------------------
@@ -102,6 +152,13 @@ func (r *InMemOrders) Upsert(_ context.Context, o entity.Order) error {
 	return nil
 }
 
+func (r *InMemOrders) GetByConversation(_ context.Context, userID uuid.UUID, conversationID string) (entity.Order, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.rows[key(userID, conversationID)]
+	return o, ok, nil
+}
+
 func (r *InMemOrders) List(_ context.Context, userID uuid.UUID, status *entity.OrderStatus, before *time.Time, limit int) ([]entity.Order, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -167,6 +224,105 @@ func (r *EventRecorder) OfType(t entity.EventType) []entity.Event {
 		}
 	}
 	return out
+}
+
+// --- InMemSubscriptions --------------------------------------------------------
+
+// InMemSubscriptions backs both the messages usecases' SubscriptionResolver
+// and the subscriptions usecases' SubscriptionRepo.
+type InMemSubscriptions struct {
+	mu    sync.Mutex
+	users map[uuid.UUID]entity.User           // user id → user
+	subs  map[string]entity.GraphSubscription // graph subscription id → row
+}
+
+func NewInMemSubscriptions() *InMemSubscriptions {
+	return &InMemSubscriptions{
+		users: make(map[uuid.UUID]entity.User),
+		subs:  make(map[string]entity.GraphSubscription),
+	}
+}
+
+// AddUser registers the user rows the join in ResolveSubscription would see.
+func (r *InMemSubscriptions) AddUser(u entity.User) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.users[u.ID] = u
+}
+
+func (r *InMemSubscriptions) UpsertForUser(_ context.Context, userID uuid.UUID, graphSubscriptionID string, expiresAt time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, s := range r.subs { // one subscription per user, like ON CONFLICT (user_id)
+		if s.UserID == userID {
+			delete(r.subs, id)
+		}
+	}
+	r.subs[graphSubscriptionID] = entity.GraphSubscription{
+		ID: uuid.New(), UserID: userID,
+		GraphSubscriptionID: graphSubscriptionID, ExpiresAt: expiresAt, CreatedAt: time.Now(),
+	}
+	return nil
+}
+
+func (r *InMemSubscriptions) ResolveSubscription(_ context.Context, graphSubscriptionID string) (entity.User, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.subs[graphSubscriptionID]
+	if !ok {
+		return entity.User{}, false, nil
+	}
+	u, ok := r.users[s.UserID]
+	return u, ok, nil
+}
+
+func (r *InMemSubscriptions) ListExpiring(_ context.Context, before time.Time) ([]entity.GraphSubscription, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []entity.GraphSubscription
+	for _, s := range r.subs {
+		if s.ExpiresAt.Before(before) {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+func (r *InMemSubscriptions) UpdateExpiry(_ context.Context, graphSubscriptionID string, expiresAt time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.subs[graphSubscriptionID]
+	if !ok {
+		return fmt.Errorf("fake subscriptions: no subscription %q", graphSubscriptionID)
+	}
+	s.ExpiresAt = expiresAt
+	r.subs[graphSubscriptionID] = s
+	return nil
+}
+
+// --- FakeTokens ----------------------------------------------------------------
+
+// FakeTokens is an in-memory TokenSource/TokenSink.
+type FakeTokens struct {
+	mu     sync.Mutex
+	tokens map[uuid.UUID]string
+}
+
+func NewFakeTokens() *FakeTokens {
+	return &FakeTokens{tokens: make(map[uuid.UUID]string)}
+}
+
+func (f *FakeTokens) Put(userID uuid.UUID, token string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tokens[userID] = token
+}
+
+func (f *FakeTokens) GraphToken(userID uuid.UUID) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.tokens[userID]
+	return t, ok
 }
 
 // --- StaticResolver ----------------------------------------------------------
