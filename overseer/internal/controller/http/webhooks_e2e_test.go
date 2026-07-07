@@ -32,9 +32,16 @@ func newWebhookEnv(t *testing.T) *webhookEnv {
 	t.Helper()
 
 	user := entity.User{ID: uuid.New(), AccountID: uuid.New(), Email: "op@distributor.com"}
-	graph := &testutil.FakeGraph{MessagesByID: map[string]entity.EmailMessage{}}
-	llm := &testutil.FakeLLM{Extractions: map[string]entity.OrderExtraction{}}
+	graph := &testutil.FakeGraph{
+		MessagesByID:      map[string]entity.EmailMessage{},
+		ConversationsByID: map[string][]entity.EmailMessage{},
+	}
+	llm := &testutil.FakeLLM{
+		Extractions: map[string]entity.OrderExtraction{},
+		Findings:    map[string][]entity.DiscrepancyFinding{},
+	}
 	repo := testutil.NewInMemOrders()
+	discs := testutil.NewInMemDiscrepancies()
 	events := &testutil.EventRecorder{}
 	subs := testutil.NewInMemSubscriptions()
 	tokens := testutil.NewFakeTokens()
@@ -50,6 +57,7 @@ func newWebhookEnv(t *testing.T) *webhookEnv {
 		Subs: subs, Tokens: tokens,
 		Latest: &messages.GetLatestMessage{Graph: graph},
 		LLM:    llm, Repo: repo, Events: events,
+		Audit:  &orders.CatchDiscrepancies{Graph: graph, LLM: llm, Repo: discs, Events: events},
 	}
 	ensure := &subscriptions.EnsureSubscription{
 		Graph: graph, Repo: subs,
@@ -85,7 +93,7 @@ func newWebhookEnv(t *testing.T) *webhookEnv {
 	srv := httptest.NewServer(e)
 	t.Cleanup(srv.Close)
 	return &webhookEnv{
-		env:    &env{srv: srv, user: user, graph: graph, llm: llm, repo: repo, events: events},
+		env:    &env{srv: srv, user: user, graph: graph, llm: llm, repo: repo, discs: discs, events: events},
 		subs:   subs,
 		tokens: tokens,
 	}
@@ -145,6 +153,64 @@ func TestWebhookNotificationUpdatesOrder(t *testing.T) {
 	}
 	if len(e.events.OfType(entity.EventOrderUpdated)) != 1 {
 		t.Error("no order.updated event published")
+	}
+}
+
+func TestWebhookNotificationRunsAudit(t *testing.T) {
+	e := newWebhookEnv(t)
+	// A known order conversation with history.
+	if err := e.repo.Upsert(context.Background(), entity.Order{
+		AccountID: e.user.AccountID, UserID: e.user.ID,
+		ConversationID: "conv-1", CompanyName: "Delmar Tooling",
+		EmailAddress: "dana@delmar.com", OrderID: 4471,
+		Status: entity.OrderStatusConfirmed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldMsg := entity.EmailMessage{
+		ID: "msg-1", ConversationID: "conv-1", From: "dana@delmar.com",
+		WebLink: "https://outlook.example/msg-1", CreatedDateTime: time.Now().Add(-72 * time.Hour),
+	}
+	newMsg := entity.EmailMessage{
+		ID: "msg-2", ConversationID: "conv-1", From: "dana@delmar.com",
+		FromName: "Dana Delmar", WebLink: "https://outlook.example/msg-2",
+		CreatedDateTime: time.Now(),
+	}
+	e.graph.MessagesByID["msg-2"] = newMsg
+	e.graph.ConversationsByID["conv-1"] = []entity.EmailMessage{oldMsg, newMsg}
+	e.llm.Extractions["conv-1"] = entity.OrderExtraction{Status: entity.OrderStatusIssue}
+	e.llm.Findings["msg-2"] = []entity.DiscrepancyFinding{{
+		Title: "Price raised $41.00 → $42.50/unit", Priority: entity.PriorityHigh,
+		Detail: entity.DiscrepancyDetail{PreviouslyAgreed: "$41.00/unit", NewMetric: "$42.50/unit", Type: entity.MetricPrice},
+		Quotes: []entity.DiscrepancyQuote{{Quote: "we agree on $41.00/unit", MessageLink: "https://outlook.example/msg-1"}},
+	}}
+
+	resp := e.postJSON(t, "/webhooks/graph", `{
+		"value": [{
+			"subscriptionId": "sub-1",
+			"changeType": "created",
+			"clientState": "test-client-state",
+			"resourceData": {"id": "msg-2"}
+		}]
+	}`)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	if e.discs.Count() != 1 {
+		t.Fatalf("discrepancy rows = %d, want 1", e.discs.Count())
+	}
+	stored := e.discs.All()[0]
+	if stored.CompanyName != "Delmar Tooling" || stored.OrderID != 4471 ||
+		stored.EmailDeeplinkURL != "https://outlook.example/msg-2" ||
+		stored.Status != entity.DiscrepancyOpen {
+		t.Errorf("stored = %+v", stored)
+	}
+	if len(e.events.OfType(entity.EventDiscrepancyFound)) != 1 {
+		t.Error("no discrepancy.found event recorded")
+	}
+	if len(e.events.OfType(entity.EventOrderUpdated)) != 1 {
+		t.Error("order.updated missing — audit must not replace the order leg")
 	}
 }
 

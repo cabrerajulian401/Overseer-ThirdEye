@@ -19,6 +19,7 @@ type RouterDeps struct {
 	Tokens        TokenSink // optional: caches Graph tokens for background jobs
 	Orders        *OrdersController
 	Subscriptions *SubscriptionsController
+	Discrepancies *DiscrepanciesController
 	Webhooks      *WebhooksController
 	WS            WSHandler
 	Log           *slog.Logger
@@ -47,6 +48,10 @@ func NewRouter(d RouterDeps) *echo.Echo {
 	e.GET("/ws", func(c echo.Context) error { return d.WS.Handler(c) }, auth)
 	if d.Subscriptions != nil {
 		e.POST("/subscriptions", d.Subscriptions.PostSubscriptions, auth)
+	}
+	if d.Discrepancies != nil {
+		e.GET("/discrepancies", d.Discrepancies.GetDiscrepancies, auth)
+		e.PATCH("/discrepancies/:discrepancyId", d.Discrepancies.PatchDiscrepancy, auth)
 	}
 	if d.Webhooks != nil {
 		// No auth middleware: Graph POSTs here directly; clientState is the check.
