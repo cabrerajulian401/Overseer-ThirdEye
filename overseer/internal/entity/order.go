@@ -56,3 +56,29 @@ type OrderExtraction struct {
 	LastMessenger   string
 	SupportingQuote string
 }
+
+// OrderFromExtraction builds an Order from a thread and its LLM extraction —
+// conversation-level fields only; the caller stamps ownership (account/user)
+// before persisting. Empty extraction fields fall back to the latest message.
+func OrderFromExtraction(thread Thread, x OrderExtraction) Order {
+	latest := thread.LatestMessage()
+	o := Order{
+		ConversationID:  thread.ConversationID,
+		CompanyName:     x.CompanyName,
+		EmailAddress:    x.EmailAddress,
+		OrderID:         x.OrderID,
+		EmailURL:        latest.WebLink,
+		Status:          x.Status,
+		OriginalEstDate: x.OriginalEstDate,
+		CurrentEstDate:  x.CurrentEstDate,
+		LastMessenger:   x.LastMessenger,
+		SupportingQuote: x.SupportingQuote,
+	}
+	if o.LastMessenger == "" {
+		o.LastMessenger = latest.FromName
+	}
+	if o.EmailAddress == "" {
+		o.EmailAddress = latest.From
+	}
+	return o
+}

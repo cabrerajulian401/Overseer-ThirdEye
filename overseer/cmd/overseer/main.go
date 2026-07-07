@@ -16,7 +16,10 @@ import (
 	"github.com/thirdeye/overseer/internal/gateway/graph"
 	"github.com/thirdeye/overseer/internal/gateway/llm"
 	"github.com/thirdeye/overseer/internal/repo"
+	"github.com/thirdeye/overseer/internal/tokencache"
+	"github.com/thirdeye/overseer/internal/usecase/messages"
 	"github.com/thirdeye/overseer/internal/usecase/orders"
+	"github.com/thirdeye/overseer/internal/usecase/subscriptions"
 )
 
 // Compile-time conformance: adapters satisfy the usecase ports structurally,
@@ -26,6 +29,19 @@ var (
 	_ orders.OrderLLM       = (*llm.Gateway)(nil)
 	_ orders.OrderRepo      = (*repo.Orders)(nil)
 	_ orders.EventPublisher = (*ws.Hub)(nil)
+
+	_ messages.MessageGetter        = (*graph.Client)(nil)
+	_ messages.OrderLLM             = (*llm.Gateway)(nil)
+	_ messages.OrderRepo            = (*repo.Orders)(nil)
+	_ messages.SubscriptionResolver = (*repo.Subscriptions)(nil)
+	_ messages.TokenSource          = (*tokencache.Cache)(nil)
+	_ messages.EventPublisher       = (*ws.Hub)(nil)
+
+	_ subscriptions.GraphSubscriber  = (*graph.Client)(nil)
+	_ subscriptions.SubscriptionRepo = (*repo.Subscriptions)(nil)
+	_ subscriptions.TokenSource      = (*tokencache.Cache)(nil)
+
+	_ httpctl.TokenSink = (*tokencache.Cache)(nil)
 )
 
 type config struct {
@@ -35,6 +51,12 @@ type config struct {
 	SeedAccountName  string
 	SeedUserEmail    string
 	SyncLookbackDays int
+
+	PublicBaseURL    string // where Graph reaches us; must be public https in real use
+	GraphClientState string // shared secret in every notification
+	SubscriptionTTL  time.Duration
+	RenewAhead       time.Duration
+	RenewInterval    time.Duration
 }
 
 func loadConfig() config {
@@ -45,6 +67,12 @@ func loadConfig() config {
 		SeedAccountName:  envOr("SEED_ACCOUNT_NAME", "ThirdEye Dev"),
 		SeedUserEmail:    envOr("SEED_USER_EMAIL", "operator@example.com"),
 		SyncLookbackDays: 30,
+
+		PublicBaseURL:    envOr("PUBLIC_BASE_URL", "http://localhost:8080"),
+		GraphClientState: envOr("GRAPH_CLIENT_STATE", "overseer-dev-client-state"),
+		SubscriptionTTL:  48 * time.Hour, // Graph caps message subscriptions ~3 days
+		RenewAhead:       12 * time.Hour,
+		RenewInterval:    time.Hour,
 	}
 }
 
@@ -108,6 +136,8 @@ func main() {
 	graphClient := graph.New()
 	llmGateway := llm.New(cfg.LLMModel, log)
 	orderRepo := repo.NewOrders(pool)
+	subsRepo := repo.NewSubscriptions(pool)
+	tokens := tokencache.New()
 	hub := ws.NewHub(log)
 
 	// Usecases.
@@ -117,6 +147,31 @@ func main() {
 		Format: &orders.FormatInitialOrderData{LLM: llmGateway},
 		Repo:   orderRepo,
 		Events: hub,
+	}
+	handleChange := &messages.HandleChangeMessage{
+		Subs:   subsRepo,
+		Tokens: tokens,
+		Latest: &messages.GetLatestMessage{Graph: graphClient},
+		LLM:    llmGateway,
+		Repo:   orderRepo,
+		Events: hub,
+	}
+	ensureSub := &subscriptions.EnsureSubscription{
+		Graph:           graphClient,
+		Repo:            subsRepo,
+		NotificationURL: cfg.PublicBaseURL + "/webhooks/graph",
+		ClientState:     cfg.GraphClientState,
+		TTL:             cfg.SubscriptionTTL,
+		Now:             time.Now,
+	}
+	renewSubs := &subscriptions.RenewDueSubscriptions{
+		Graph:      graphClient,
+		Repo:       subsRepo,
+		Tokens:     tokens,
+		TTL:        cfg.SubscriptionTTL,
+		RenewAhead: cfg.RenewAhead,
+		Now:        time.Now,
+		Log:        log,
 	}
 
 	// Controllers + router.
@@ -131,11 +186,33 @@ func main() {
 	}
 
 	e := httpctl.NewRouter(httpctl.RouterDeps{
-		Resolver: staticResolver{user: seedUser},
-		Orders:   ordersController,
-		WS:       hub,
-		Log:      log,
+		Resolver:      staticResolver{user: seedUser},
+		Tokens:        tokens,
+		Orders:        ordersController,
+		Subscriptions: &httpctl.SubscriptionsController{Ensure: ensureSub, Log: log},
+		Webhooks: &httpctl.WebhooksController{
+			Handle:      handleChange,
+			ClientState: cfg.GraphClientState,
+			Dispatch:    func(fn func()) { go fn() },
+			Log:         log,
+		},
+		WS:  hub,
+		Log: log,
 	})
+
+	// Renewal worker: message subscriptions expire (~3 days max); renew
+	// anything entering the RenewAhead window every RenewInterval.
+	go func() {
+		ticker := time.NewTicker(cfg.RenewInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if n, err := renewSubs.Execute(ctx); err != nil {
+				log.Error("subscription renewal pass failed", "error", err)
+			} else if n > 0 {
+				log.Info("subscriptions renewed", "count", n)
+			}
+		}
+	}()
 
 	log.Info("overseer listening", "port", cfg.Port)
 	if err := e.Start(":" + cfg.Port); err != nil {

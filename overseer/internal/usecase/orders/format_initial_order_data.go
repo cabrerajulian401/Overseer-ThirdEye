@@ -40,7 +40,7 @@ func (uc *FormatInitialOrderData) Execute(ctx context.Context, msgs []entity.Ema
 		if err != nil {
 			return nil, fmt.Errorf("extract order fields (conversation %s): %w", thread.ConversationID, err)
 		}
-		orders = append(orders, orderFromExtraction(thread, extraction))
+		orders = append(orders, entity.OrderFromExtraction(thread, extraction))
 	}
 	return orders, nil
 }
@@ -75,25 +75,3 @@ func groupThreads(msgs []entity.EmailMessage, keptConversationIDs []string) []en
 	return threads
 }
 
-func orderFromExtraction(thread entity.Thread, x entity.OrderExtraction) entity.Order {
-	latest := thread.LatestMessage()
-	o := entity.Order{
-		ConversationID:  thread.ConversationID,
-		CompanyName:     x.CompanyName,
-		EmailAddress:    x.EmailAddress,
-		OrderID:         x.OrderID,
-		EmailURL:        latest.WebLink,
-		Status:          x.Status,
-		OriginalEstDate: x.OriginalEstDate,
-		CurrentEstDate:  x.CurrentEstDate,
-		LastMessenger:   x.LastMessenger,
-		SupportingQuote: x.SupportingQuote,
-	}
-	if o.LastMessenger == "" {
-		o.LastMessenger = latest.FromName
-	}
-	if o.EmailAddress == "" {
-		o.EmailAddress = latest.From
-	}
-	return o
-}
