@@ -57,7 +57,7 @@ func newWebhookEnv(t *testing.T) *webhookEnv {
 		Subs: subs, Tokens: tokens,
 		Latest: &messages.GetLatestMessage{Graph: graph},
 		LLM:    llm, Repo: repo, Events: events,
-		Audit:  &orders.CatchDiscrepancies{Graph: graph, LLM: llm, Repo: discs, Events: events},
+		Audit: &orders.CatchDiscrepancies{Graph: graph, LLM: llm, Repo: discs, Events: events},
 	}
 	ensure := &subscriptions.EnsureSubscription{
 		Graph: graph, Repo: subs,

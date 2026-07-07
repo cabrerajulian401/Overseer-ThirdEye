@@ -25,10 +25,13 @@ import (
 // Compile-time conformance: adapters satisfy the usecase ports structurally,
 // asserted here so a drifting signature fails the build, not a request.
 var (
-	_ orders.MessageLister  = (*graph.Client)(nil)
-	_ orders.OrderLLM       = (*llm.Gateway)(nil)
-	_ orders.OrderRepo      = (*repo.Orders)(nil)
-	_ orders.EventPublisher = (*ws.Hub)(nil)
+	_ orders.MessageLister   = (*graph.Client)(nil)
+	_ orders.OrderLLM        = (*llm.Gateway)(nil)
+	_ orders.OrderRepo       = (*repo.Orders)(nil)
+	_ orders.EventPublisher  = (*ws.Hub)(nil)
+	_ orders.ThreadFetcher   = (*graph.Client)(nil)
+	_ orders.DiscrepancyLLM  = (*llm.Gateway)(nil)
+	_ orders.DiscrepancyRepo = (*repo.Discrepancies)(nil)
 
 	_ messages.MessageGetter        = (*graph.Client)(nil)
 	_ messages.OrderLLM             = (*llm.Gateway)(nil)
@@ -36,6 +39,7 @@ var (
 	_ messages.SubscriptionResolver = (*repo.Subscriptions)(nil)
 	_ messages.TokenSource          = (*tokencache.Cache)(nil)
 	_ messages.EventPublisher       = (*ws.Hub)(nil)
+	_ messages.DiscrepancyCatcher   = (*orders.CatchDiscrepancies)(nil)
 
 	_ subscriptions.GraphSubscriber  = (*graph.Client)(nil)
 	_ subscriptions.SubscriptionRepo = (*repo.Subscriptions)(nil)
@@ -137,6 +141,7 @@ func main() {
 	llmGateway := llm.New(cfg.LLMModel, log)
 	orderRepo := repo.NewOrders(pool)
 	subsRepo := repo.NewSubscriptions(pool)
+	discRepo := repo.NewDiscrepancies(pool)
 	tokens := tokencache.New()
 	hub := ws.NewHub(log)
 
@@ -155,6 +160,12 @@ func main() {
 		LLM:    llmGateway,
 		Repo:   orderRepo,
 		Events: hub,
+		Audit: &orders.CatchDiscrepancies{
+			Graph:  graphClient,
+			LLM:    llmGateway,
+			Repo:   discRepo,
+			Events: hub,
+		},
 	}
 	ensureSub := &subscriptions.EnsureSubscription{
 		Graph:           graphClient,
@@ -190,6 +201,11 @@ func main() {
 		Tokens:        tokens,
 		Orders:        ordersController,
 		Subscriptions: &httpctl.SubscriptionsController{Ensure: ensureSub, Log: log},
+		Discrepancies: &httpctl.DiscrepanciesController{
+			List:   &orders.ListDiscrepancies{Repo: discRepo},
+			Update: &orders.UpdateDiscrepancyStatus{Repo: discRepo},
+			Log:    log,
+		},
 		Webhooks: &httpctl.WebhooksController{
 			Handle:      handleChange,
 			ClientState: cfg.GraphClientState,
