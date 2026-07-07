@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/thirdeye/overseer/internal/entity"
@@ -226,6 +228,33 @@ func (c *Client) GetMessage(ctx context.Context, accessToken, messageID string) 
 		return entity.EmailMessage{}, fmt.Errorf("graph: decode message: %w", err)
 	}
 	return toEntity(gm), nil
+}
+
+// ListConversationMessages fetches every message in a conversation — the
+// Audit read path: history is re-fetched from Graph at audit time, never
+// stored. Results are sorted oldest → newest (the entity.Thread convention)
+// here, because Graph rejects $orderby combined with the conversationId
+// $filter (InefficientFilter).
+func (c *Client) ListConversationMessages(ctx context.Context, accessToken, conversationID string) ([]entity.EmailMessage, error) {
+	q := url.Values{}
+	q.Set("$select", "id,conversationId,conversationIndex,from,subject,body,bodyPreview,webLink,createdDateTime")
+	q.Set("$filter", fmt.Sprintf("conversationId eq '%s'", strings.ReplaceAll(conversationID, "'", "''")))
+	q.Set("$top", fmt.Sprintf("%d", pageSize))
+	next := c.BaseURL + "/me/messages?" + q.Encode()
+
+	var out []entity.EmailMessage
+	for next != "" && len(out) < maxMessages {
+		page, err := c.fetchPage(ctx, accessToken, next)
+		if err != nil {
+			return nil, err
+		}
+		for _, gm := range page.Value {
+			out = append(out, toEntity(gm))
+		}
+		next = page.NextLink
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedDateTime.Before(out[j].CreatedDateTime) })
+	return out, nil
 }
 
 func toEntity(gm graphMessage) entity.EmailMessage {
