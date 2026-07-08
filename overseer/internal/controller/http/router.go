@@ -20,6 +20,7 @@ type RouterDeps struct {
 	Orders        *OrdersController
 	Subscriptions *SubscriptionsController
 	Discrepancies *DiscrepanciesController
+	Otto          *OttoController
 	Webhooks      *WebhooksController
 	WS            WSHandler
 	Log           *slog.Logger
@@ -52,6 +53,10 @@ func NewRouter(d RouterDeps) *echo.Echo {
 	if d.Discrepancies != nil {
 		e.GET("/discrepancies", d.Discrepancies.GetDiscrepancies, auth)
 		e.PATCH("/discrepancies/:discrepancyId", d.Discrepancies.PatchDiscrepancy, auth)
+	}
+	if d.Otto != nil {
+		e.POST("/otto/scans", d.Otto.PostScans, auth)
+		e.POST("/otto/scans/:scanId/record", d.Otto.PostRecord, auth)
 	}
 	if d.Webhooks != nil {
 		// No auth middleware: Graph POSTs here directly; clientState is the check.
