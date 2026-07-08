@@ -38,6 +38,65 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type discrepancyDetailDTO struct {
+	PreviouslyAgreed string `json:"previouslyAgreed"`
+	NewMetric        string `json:"newMetric"`
+	Type             string `json:"type"`
+}
+
+type discrepancyQuoteDTO struct {
+	Quote       string `json:"quote"`
+	MessageLink string `json:"messageLink,omitempty"`
+}
+
+type discrepancyDTO struct {
+	ID               string                `json:"id"`
+	ConversationID   string                `json:"conversationId"`
+	Status           string                `json:"status"`
+	CompanyName      string                `json:"companyName"`
+	EmailAddress     string                `json:"emailAddress,omitempty"`
+	EmailDeeplinkURL string                `json:"emailDeeplinkUrl,omitempty"`
+	OrderID          int                   `json:"orderId"`
+	Priority         string                `json:"priority"`
+	Title            string                `json:"title"`
+	Detail           discrepancyDetailDTO  `json:"detail"`
+	Quotes           []discrepancyQuoteDTO `json:"quotes"`
+	DateCreated      string                `json:"dateCreated"`
+}
+
+type listDiscrepanciesResponse struct {
+	Discrepancies []discrepancyDTO `json:"discrepancies"`
+}
+
+type patchDiscrepancyRequest struct {
+	Status string `json:"status"`
+}
+
+func toDiscrepancyDTO(d entity.Discrepancy) discrepancyDTO {
+	quotes := make([]discrepancyQuoteDTO, 0, len(d.Quotes))
+	for _, q := range d.Quotes {
+		quotes = append(quotes, discrepancyQuoteDTO{Quote: q.Quote, MessageLink: q.MessageLink})
+	}
+	return discrepancyDTO{
+		ID:               d.ID.String(),
+		ConversationID:   d.ConversationID,
+		Status:           string(d.Status),
+		CompanyName:      d.CompanyName,
+		EmailAddress:     d.EmailAddress,
+		EmailDeeplinkURL: d.EmailDeeplinkURL,
+		OrderID:          d.OrderID,
+		Priority:         string(d.Priority),
+		Title:            d.Title,
+		Detail: discrepancyDetailDTO{
+			PreviouslyAgreed: d.Detail.PreviouslyAgreed,
+			NewMetric:        d.Detail.NewMetric,
+			Type:             string(d.Detail.Type),
+		},
+		Quotes:      quotes,
+		DateCreated: d.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
 // graphNotification mirrors one entry of Graph's change-notification POST.
 type graphNotification struct {
 	SubscriptionID string `json:"subscriptionId"`

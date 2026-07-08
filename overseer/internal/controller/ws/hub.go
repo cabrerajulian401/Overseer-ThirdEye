@@ -44,6 +44,34 @@ type orderDTO struct {
 	SupportingQuote string  `json:"supportingQuote,omitempty"`
 }
 
+type discrepancyDetailDTO struct {
+	PreviouslyAgreed string `json:"previouslyAgreed"`
+	NewMetric        string `json:"newMetric"`
+	Type             string `json:"type"`
+}
+
+type discrepancyQuoteDTO struct {
+	Quote       string `json:"quote"`
+	MessageLink string `json:"messageLink,omitempty"`
+}
+
+// discrepancyDTO is discrepancy.found's wire shape — same camelCase fields
+// the HTTP layer serves, mapped here because each edge owns its own DTOs.
+type discrepancyDTO struct {
+	ID               string                `json:"id"`
+	ConversationID   string                `json:"conversationId"`
+	Status           string                `json:"status"`
+	CompanyName      string                `json:"companyName"`
+	EmailAddress     string                `json:"emailAddress,omitempty"`
+	EmailDeeplinkURL string                `json:"emailDeeplinkUrl,omitempty"`
+	OrderID          int                   `json:"orderId"`
+	Priority         string                `json:"priority"`
+	Title            string                `json:"title"`
+	Detail           discrepancyDetailDTO  `json:"detail"`
+	Quotes           []discrepancyQuoteDTO `json:"quotes"`
+	DateCreated      string                `json:"dateCreated"`
+}
+
 func dateString(t *time.Time) *string {
 	if t == nil {
 		return nil
@@ -143,6 +171,29 @@ func toDTO(data any) any {
 			CurrentEstDate:  dateString(d.CurrentEstDate),
 			LastMessenger:   d.LastMessenger,
 			SupportingQuote: d.SupportingQuote,
+		}
+	case entity.Discrepancy:
+		quotes := make([]discrepancyQuoteDTO, 0, len(d.Quotes))
+		for _, q := range d.Quotes {
+			quotes = append(quotes, discrepancyQuoteDTO{Quote: q.Quote, MessageLink: q.MessageLink})
+		}
+		return discrepancyDTO{
+			ID:               d.ID.String(),
+			ConversationID:   d.ConversationID,
+			Status:           string(d.Status),
+			CompanyName:      d.CompanyName,
+			EmailAddress:     d.EmailAddress,
+			EmailDeeplinkURL: d.EmailDeeplinkURL,
+			OrderID:          d.OrderID,
+			Priority:         string(d.Priority),
+			Title:            d.Title,
+			Detail: discrepancyDetailDTO{
+				PreviouslyAgreed: d.Detail.PreviouslyAgreed,
+				NewMetric:        d.Detail.NewMetric,
+				Type:             string(d.Detail.Type),
+			},
+			Quotes:      quotes,
+			DateCreated: d.CreatedAt.UTC().Format(time.RFC3339),
 		}
 	default:
 		return d

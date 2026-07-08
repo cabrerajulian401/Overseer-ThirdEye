@@ -35,6 +35,40 @@ func TestInMemOrdersGetByConversation(t *testing.T) {
 	}
 }
 
+func TestInMemDiscrepancies(t *testing.T) {
+	repo := NewInMemDiscrepancies()
+	userID := uuid.New()
+
+	stored, err := repo.Insert(context.Background(), entity.Discrepancy{
+		AccountID: uuid.New(), UserID: userID, ConversationID: "conv-1",
+		Status: entity.DiscrepancyOpen, CompanyName: "Delmar Tooling",
+		Priority: entity.PriorityHigh, Title: "Price raised",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ID == uuid.Nil {
+		t.Fatal("Insert did not mint an id")
+	}
+
+	open := entity.DiscrepancyOpen
+	rows, err := repo.ListByUser(context.Background(), userID, &open)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListByUser = %v, %v", rows, err)
+	}
+
+	updated, found, err := repo.UpdateStatus(context.Background(), userID, stored.ID, entity.DiscrepancyResolved)
+	if err != nil || !found || updated.Status != entity.DiscrepancyResolved {
+		t.Fatalf("UpdateStatus = %+v, %v, %v", updated, found, err)
+	}
+	if rows, _ = repo.ListByUser(context.Background(), userID, &open); len(rows) != 0 {
+		t.Fatalf("open rows after resolve = %d, want 0", len(rows))
+	}
+	if _, found, _ = repo.UpdateStatus(context.Background(), uuid.New(), stored.ID, entity.DiscrepancyOpen); found {
+		t.Fatal("another user's update matched the row")
+	}
+}
+
 func TestInMemSubscriptions(t *testing.T) {
 	subs := NewInMemSubscriptions()
 	user := entity.User{ID: uuid.New(), AccountID: uuid.New(), Email: "op@x.com"}

@@ -42,3 +42,10 @@ type TokenSource interface {
 type EventPublisher interface {
 	Publish(e entity.Event)
 }
+
+// DiscrepancyCatcher is the Audit hook — usecase/orders.CatchDiscrepancies
+// satisfies it structurally. It audits the new message against its
+// conversation history and returns whatever it stored.
+type DiscrepancyCatcher interface {
+	Execute(ctx context.Context, accessToken string, order entity.Order, newMsg entity.EmailMessage) ([]entity.Discrepancy, error)
+}

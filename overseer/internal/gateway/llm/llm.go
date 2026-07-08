@@ -278,6 +278,168 @@ func toExtraction(out extractResult) (entity.OrderExtraction, error) {
 	}, nil
 }
 
+// --- FindDiscrepancies --------------------------------------------------------
+
+const discrepancySystemPrompt = `You audit a wholesale distributor's supplier email thread for buyer/seller discrepancies.
+Input: JSON with "newMessage" (the message that just arrived) and "history" (the earlier messages in the same conversation, oldest to newest, each carrying its index).
+Compare the new message against what the two parties previously agreed in the history. Report a finding ONLY when the history establishes an agreed value (a price, a delivery/ship date, or a quantity/unit) and the new message states a different value for the same thing.
+Field guidance:
+- title: one short line naming the change, e.g. "Price raised $41.00 → $42.50/unit".
+- priority: "high" (price increases, major delays, quantity shortfalls), "medium" (moderate changes), "low" (minor slips).
+- type: "price", "date", or "unit" — the metric that changed.
+- previouslyAgreed: the agreed value as stated in the history.
+- newMetric: the conflicting value in the new message.
+- quotes: verbatim quotes from the HISTORY that evidence the previously agreed value; each quote carries the index of the history message it came from.
+In each finding, state the explanation first, then the fields. Do not report normal updates the parties agree on, restatements of the same value, or first-time values with no prior agreement. When in doubt, report nothing: an empty findings list is the correct output for a clean thread.`
+
+var discrepancySchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"findings": map[string]any{
+			"type": "array",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"explanation":      map[string]any{"type": "string"},
+					"title":            map[string]any{"type": "string"},
+					"priority":         map[string]any{"type": "string", "enum": []string{"high", "medium", "low"}},
+					"type":             map[string]any{"type": "string", "enum": []string{"price", "date", "unit"}},
+					"previouslyAgreed": map[string]any{"type": "string"},
+					"newMetric":        map[string]any{"type": "string"},
+					"quotes": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"quote":        map[string]any{"type": "string"},
+								"messageIndex": map[string]any{"type": "integer"},
+							},
+							"required":             []string{"quote", "messageIndex"},
+							"additionalProperties": false,
+						},
+					},
+				},
+				"required":             []string{"explanation", "title", "priority", "type", "previouslyAgreed", "newMetric", "quotes"},
+				"additionalProperties": false,
+			},
+		},
+	},
+	"required":             []string{"findings"},
+	"additionalProperties": false,
+}
+
+type findingQuote struct {
+	Quote        string `json:"quote"`
+	MessageIndex int    `json:"messageIndex"`
+}
+
+type finding struct {
+	Explanation      string         `json:"explanation"`
+	Title            string         `json:"title"`
+	Priority         string         `json:"priority"`
+	Type             string         `json:"type"`
+	PreviouslyAgreed string         `json:"previouslyAgreed"`
+	NewMetric        string         `json:"newMetric"`
+	Quotes           []findingQuote `json:"quotes"`
+}
+
+type findingsResult struct {
+	Findings []finding `json:"findings"`
+}
+
+// FindDiscrepancies compares the new message against the conversation history
+// and returns zero or more validated findings. Quote message indexes are
+// resolved to webLinks here, at the gateway boundary.
+func (g *Gateway) FindDiscrepancies(ctx context.Context, newMsg entity.EmailMessage, history []entity.EmailMessage) ([]entity.DiscrepancyFinding, error) {
+	type auditMsg struct {
+		Index    int    `json:"index"`
+		From     string `json:"from"`
+		FromName string `json:"fromName"`
+		Date     string `json:"date"`
+		Subject  string `json:"subject"`
+		Body     string `json:"body"`
+	}
+	if len(history) > maxThreadMessages {
+		history = history[len(history)-maxThreadMessages:]
+	}
+	toAuditMsg := func(i int, m entity.EmailMessage) auditMsg {
+		body := m.Body
+		if body == "" {
+			body = m.BodyPreview
+		}
+		return auditMsg{
+			Index: i, From: m.From, FromName: m.FromName,
+			Date: m.CreatedDateTime.Format(time.RFC3339), Subject: m.Subject,
+			Body: truncate(body, maxBodyChars),
+		}
+	}
+	hist := make([]auditMsg, 0, len(history))
+	for i, m := range history {
+		hist = append(hist, toAuditMsg(i, m))
+	}
+	payload := map[string]any{"newMessage": toAuditMsg(-1, newMsg), "history": hist}
+	userMsg, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("llm: marshal audit payload: %w", err)
+	}
+
+	var findings []entity.DiscrepancyFinding
+	err = g.callJSON(ctx, "FindDiscrepancies", discrepancySystemPrompt, string(userMsg), discrepancySchema, func(raw []byte) error {
+		var out findingsResult
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return fmt.Errorf("invalid JSON: %w", err)
+		}
+		fs, err := toFindings(out, history)
+		if err != nil {
+			return err
+		}
+		findings = fs
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return findings, nil
+}
+
+// toFindings validates model output at the gateway boundary: enums must
+// match, titles must be present, and quote indexes must point into the
+// history the model was shown.
+func toFindings(out findingsResult, history []entity.EmailMessage) ([]entity.DiscrepancyFinding, error) {
+	findings := make([]entity.DiscrepancyFinding, 0, len(out.Findings))
+	for _, f := range out.Findings {
+		if f.Title == "" {
+			return nil, fmt.Errorf("finding with empty title")
+		}
+		priority := entity.Priority(f.Priority)
+		if !entity.ValidPriority(priority) {
+			return nil, fmt.Errorf("invalid priority %q", f.Priority)
+		}
+		metric := entity.MetricType(f.Type)
+		if !entity.ValidMetricType(metric) {
+			return nil, fmt.Errorf("invalid metric type %q", f.Type)
+		}
+		quotes := make([]entity.DiscrepancyQuote, 0, len(f.Quotes))
+		for _, q := range f.Quotes {
+			if q.MessageIndex < 0 || q.MessageIndex >= len(history) {
+				return nil, fmt.Errorf("quote messageIndex %d out of range", q.MessageIndex)
+			}
+			quotes = append(quotes, entity.DiscrepancyQuote{Quote: q.Quote, MessageLink: history[q.MessageIndex].WebLink})
+		}
+		findings = append(findings, entity.DiscrepancyFinding{
+			Title:    f.Title,
+			Priority: priority,
+			Detail: entity.DiscrepancyDetail{
+				PreviouslyAgreed: f.PreviouslyAgreed,
+				NewMetric:        f.NewMetric,
+				Type:             metric,
+			},
+			Quotes: quotes,
+		})
+	}
+	return findings, nil
+}
+
 // --- shared plumbing ----------------------------------------------------------
 
 // callJSON makes one structured-output model call per attempt, validates the

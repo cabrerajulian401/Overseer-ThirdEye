@@ -36,6 +36,12 @@ type FakeGraph struct {
 	CreateCalls  []SubscriptionCall
 	RenewErr     error
 	RenewedIDs   []string
+
+	// ListConversationMessages support: conversation id → full thread,
+	// oldest → newest (like the real gateway returns).
+	ConversationsByID    map[string][]entity.EmailMessage
+	ListConvErr          error
+	ConversationsFetched []string
 }
 
 // SubscriptionCall records one CreateSubscription invocation.
@@ -84,6 +90,15 @@ func (f *FakeGraph) RenewSubscription(_ context.Context, _ string, subscriptionI
 	return nil
 }
 
+func (f *FakeGraph) ListConversationMessages(_ context.Context, accessToken, conversationID string) ([]entity.EmailMessage, error) {
+	f.TokensSeen = append(f.TokensSeen, accessToken)
+	f.ConversationsFetched = append(f.ConversationsFetched, conversationID)
+	if f.ListConvErr != nil {
+		return nil, f.ListConvErr
+	}
+	return f.ConversationsByID[conversationID], nil
+}
+
 // --- FakeLLM -----------------------------------------------------------------
 
 type FakeLLM struct {
@@ -93,10 +108,15 @@ type FakeLLM struct {
 	// Extractions maps conversation id → extraction returned for that thread.
 	Extractions map[string]entity.OrderExtraction
 	ExtractErr  error
+	// Findings maps the new message's id → what FindDiscrepancies returns.
+	Findings map[string][]entity.DiscrepancyFinding
+	FindErr  error
 
-	FilterCalls  int
-	ExtractCalls int
-	ThreadsSeen  []string
+	FilterCalls   int
+	ExtractCalls  int
+	ThreadsSeen   []string
+	FindCalls     int
+	HistoriesSeen [][]string // message ids of each history passed in
 }
 
 func (f *FakeLLM) FilterOrderMessages(_ context.Context, _ []entity.EmailMessage) ([]string, error) {
@@ -114,6 +134,19 @@ func (f *FakeLLM) ExtractOrderFields(_ context.Context, thread entity.Thread) (e
 		return entity.OrderExtraction{}, f.ExtractErr
 	}
 	return f.Extractions[thread.ConversationID], nil
+}
+
+func (f *FakeLLM) FindDiscrepancies(_ context.Context, newMsg entity.EmailMessage, history []entity.EmailMessage) ([]entity.DiscrepancyFinding, error) {
+	f.FindCalls++
+	ids := make([]string, 0, len(history))
+	for _, m := range history {
+		ids = append(ids, m.ID)
+	}
+	f.HistoriesSeen = append(f.HistoriesSeen, ids)
+	if f.FindErr != nil {
+		return nil, f.FindErr
+	}
+	return f.Findings[newMsg.ID], nil
 }
 
 // --- InMemOrders -------------------------------------------------------------
@@ -195,6 +228,76 @@ func (r *InMemOrders) All() []entity.Order {
 	out := make([]entity.Order, 0, len(r.rows))
 	for _, o := range r.rows {
 		out = append(out, o)
+	}
+	return out
+}
+
+// --- InMemDiscrepancies --------------------------------------------------------
+
+// InMemDiscrepancies is an in-memory DiscrepancyRepo.
+type InMemDiscrepancies struct {
+	mu      sync.Mutex
+	rows    map[uuid.UUID]entity.Discrepancy
+	Inserts int
+}
+
+func NewInMemDiscrepancies() *InMemDiscrepancies {
+	return &InMemDiscrepancies{rows: make(map[uuid.UUID]entity.Discrepancy)}
+}
+
+func (r *InMemDiscrepancies) Insert(_ context.Context, d entity.Discrepancy) (entity.Discrepancy, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Inserts++
+	d.ID = uuid.New()
+	d.CreatedAt = time.Now().Add(time.Duration(len(r.rows)) * time.Millisecond)
+	d.UpdatedAt = d.CreatedAt
+	r.rows[d.ID] = d
+	return d, nil
+}
+
+func (r *InMemDiscrepancies) ListByUser(_ context.Context, userID uuid.UUID, status *entity.DiscrepancyStatus) ([]entity.Discrepancy, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []entity.Discrepancy
+	for _, d := range r.rows {
+		if d.UserID != userID {
+			continue
+		}
+		if status != nil && d.Status != *status {
+			continue
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (r *InMemDiscrepancies) UpdateStatus(_ context.Context, userID, id uuid.UUID, s entity.DiscrepancyStatus) (entity.Discrepancy, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	d, ok := r.rows[id]
+	if !ok || d.UserID != userID {
+		return entity.Discrepancy{}, false, nil
+	}
+	d.Status = s
+	d.UpdatedAt = time.Now()
+	r.rows[id] = d
+	return d, true, nil
+}
+
+func (r *InMemDiscrepancies) Count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.rows)
+}
+
+func (r *InMemDiscrepancies) All() []entity.Discrepancy {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]entity.Discrepancy, 0, len(r.rows))
+	for _, d := range r.rows {
+		out = append(out, d)
 	}
 	return out
 }
