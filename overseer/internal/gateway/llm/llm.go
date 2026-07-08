@@ -561,6 +561,91 @@ func toRanked(out rankResult, candidates []entity.DriveItem) ([]entity.DriveItem
 	return ranked, nil
 }
 
+// --- PlanSheetAppend ----------------------------------------------------------
+
+const planSystemPrompt = `You map user-approved purchase-order fields onto an existing spreadsheet so a new row can be appended.
+Input: JSON with "tables" (each table's name and its column headers, in order) and "fields" (the values the user already approved).
+Pick the ONE table that is the order log for this purchase. Produce exactly one value per column of that table, in column order:
+- Copy values verbatim from the fields (dates as YYYY-MM-DD, the PO number as digits).
+- A column with no matching field gets an empty string.
+- NEVER invent, reformat beyond the above, or re-decide a value — the user already approved these.
+State the explanation first, then the table, then the values.`
+
+var planSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"explanation": map[string]any{"type": "string"},
+		"table":       map[string]any{"type": "string"},
+		"values": map[string]any{
+			"type":  "array",
+			"items": map[string]any{"type": "string"},
+		},
+	},
+	"required":             []string{"explanation", "table", "values"},
+	"additionalProperties": false,
+}
+
+type planResult struct {
+	Explanation string   `json:"explanation"`
+	Table       string   `json:"table"`
+	Values      []string `json:"values"`
+}
+
+// PlanSheetAppend decides where/how to append the user-approved fields —
+// which table and which value lands in which column. It never re-decides
+// the values; the user already approved those on the confirm card.
+func (g *Gateway) PlanSheetAppend(ctx context.Context, structure entity.WorkbookStructure, fields entity.OrderExtraction) (entity.SheetAppendPlan, error) {
+	type tablePayload struct {
+		Name    string   `json:"name"`
+		Columns []string `json:"columns"`
+	}
+	tables := make([]tablePayload, 0, len(structure.Tables))
+	for _, tbl := range structure.Tables {
+		tables = append(tables, tablePayload{Name: tbl.Name, Columns: tbl.Columns})
+	}
+	userMsg, err := json.Marshal(map[string]any{
+		"tables": tables,
+		"fields": extractionPayload(fields),
+	})
+	if err != nil {
+		return entity.SheetAppendPlan{}, fmt.Errorf("llm: marshal plan payload: %w", err)
+	}
+
+	var plan entity.SheetAppendPlan
+	err = g.callJSON(ctx, "PlanSheetAppend", planSystemPrompt, string(userMsg), planSchema, func(raw []byte) error {
+		var out planResult
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return fmt.Errorf("invalid JSON: %w", err)
+		}
+		p, err := toPlan(out, structure)
+		if err != nil {
+			return err
+		}
+		plan = p
+		return nil
+	})
+	if err != nil {
+		return entity.SheetAppendPlan{}, err
+	}
+	return plan, nil
+}
+
+// toPlan validates model output at the gateway boundary: the table must
+// exist in the structure the model was shown, and the value count must
+// match that table's column count exactly.
+func toPlan(out planResult, structure entity.WorkbookStructure) (entity.SheetAppendPlan, error) {
+	for _, tbl := range structure.Tables {
+		if tbl.Name != out.Table {
+			continue
+		}
+		if len(out.Values) != len(tbl.Columns) {
+			return entity.SheetAppendPlan{}, fmt.Errorf("table %q has %d columns, plan has %d values", tbl.Name, len(tbl.Columns), len(out.Values))
+		}
+		return entity.SheetAppendPlan{Table: out.Table, Values: out.Values}, nil
+	}
+	return entity.SheetAppendPlan{}, fmt.Errorf("unknown table %q in plan", out.Table)
+}
+
 // --- shared plumbing ----------------------------------------------------------
 
 // callJSON makes one structured-output model call per attempt, validates the

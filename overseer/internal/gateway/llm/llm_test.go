@@ -105,6 +105,43 @@ func TestToRankedEmptyIsValid(t *testing.T) {
 	}
 }
 
+func planStructure() entity.WorkbookStructure {
+	return entity.WorkbookStructure{Tables: []entity.WorkbookTable{
+		{Name: "PO_Log", Columns: []string{"PO", "Supplier", "ETA"}},
+		{Name: "Contacts", Columns: []string{"Name", "Email"}},
+	}}
+}
+
+func TestToPlanAcceptsMatchingTable(t *testing.T) {
+	out := planResult{
+		Explanation: "PO_Log is the order table",
+		Table:       "PO_Log",
+		Values:      []string{"4471", "Delmar Tooling", "2026-07-18"},
+	}
+	got, err := toPlan(out, planStructure())
+	if err != nil {
+		t.Fatalf("toPlan: %v", err)
+	}
+	if got.Table != "PO_Log" || len(got.Values) != 3 || got.Values[1] != "Delmar Tooling" {
+		t.Errorf("plan = %+v", got)
+	}
+}
+
+func TestToPlanRejectsBadOutput(t *testing.T) {
+	cases := map[string]planResult{
+		"unknown table":   {Table: "Sheet9", Values: []string{"a", "b", "c"}},
+		"too few values":  {Table: "PO_Log", Values: []string{"4471"}},
+		"too many values": {Table: "PO_Log", Values: []string{"a", "b", "c", "d"}},
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := toPlan(out, planStructure()); err == nil {
+				t.Fatal("want validation error, got nil")
+			}
+		})
+	}
+}
+
 func TestToFindingsRejectsBadOutput(t *testing.T) {
 	cases := map[string]func(f *finding){
 		"empty title":        func(f *finding) { f.Title = "" },
