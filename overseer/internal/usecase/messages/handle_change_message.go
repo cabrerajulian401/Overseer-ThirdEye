@@ -11,8 +11,8 @@ import (
 // HandleChangeMessage is the webhook job (spec: jobs/HandleChangeMessage):
 // notification → resolve subscription to user → fetch the message → LLM
 // structure → merge-upsert into orders → order.updated on the realtime
-// channel. Graph delivers at-least-once, so the whole path is idempotent —
-// the upsert is keyed on (user_id, conversation_id).
+// channel → Audit (CatchDiscrepancies). Graph delivers at-least-once, so the
+// whole path is idempotent — the upsert is keyed on (user_id, conversation_id).
 //
 // Extension point (Checkups, not built yet): this is the only place that sees
 // supplier replies — when checkup_messages exists, cancel pending rows with
@@ -24,6 +24,10 @@ type HandleChangeMessage struct {
 	LLM    OrderLLM
 	Repo   OrderRepo
 	Events EventPublisher
+
+	// Audit is the Discrepancy leg (spec: Audit rides this job and has no
+	// infrastructure of its own). nil disables it.
+	Audit DiscrepancyCatcher
 }
 
 type HandleInput struct {
@@ -107,6 +111,15 @@ func (uc *HandleChangeMessage) Execute(ctx context.Context, in HandleInput) (Han
 	}
 
 	uc.Events.Publish(entity.Event{Type: entity.EventOrderUpdated, Data: order})
+
+	// Audit rides this job. The order work above is already committed — an
+	// audit failure surfaces to the caller's log but cannot undo the upsert,
+	// and a Graph re-delivery would retry it.
+	if uc.Audit != nil {
+		if _, err := uc.Audit.Execute(ctx, token, order, msg); err != nil {
+			return outcome, fmt.Errorf("audit (conversation %s): %w", msg.ConversationID, err)
+		}
+	}
 	return outcome, nil
 }
 

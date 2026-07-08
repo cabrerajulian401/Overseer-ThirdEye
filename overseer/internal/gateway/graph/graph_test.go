@@ -101,6 +101,50 @@ func TestGetMessage(t *testing.T) {
 	}
 }
 
+func TestListConversationMessages(t *testing.T) {
+	var page2 bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/me/messages" {
+			t.Errorf("path = %q, want /me/messages", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok-123" {
+			t.Errorf("auth header = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("page") == "2" {
+			page2 = true
+			fmt.Fprint(w, `{"value": [{"id": "m-1", "conversationId": "conv'9", "createdDateTime": "2026-07-01T09:00:00Z"}]}`)
+			return
+		}
+		// single quotes in the id must be doubled inside the OData literal
+		if got := r.URL.Query().Get("$filter"); got != `conversationId eq 'conv''9'` {
+			t.Errorf("$filter = %q", got)
+		}
+		fmt.Fprintf(w, `{
+			"value": [{"id": "m-2", "conversationId": "conv'9", "createdDateTime": "2026-07-03T09:00:00Z"}],
+			"@odata.nextLink": %q
+		}`, "http://"+r.Host+"/me/messages?page=2")
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+	msgs, err := c.ListConversationMessages(context.Background(), "tok-123", "conv'9")
+	if err != nil {
+		t.Fatalf("ListConversationMessages: %v", err)
+	}
+	if !page2 {
+		t.Error("pagination nextLink not followed")
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("len = %d, want 2", len(msgs))
+	}
+	// oldest → newest (the entity.Thread convention), sorted client-side
+	// because Graph rejects $orderby combined with this $filter.
+	if msgs[0].ID != "m-1" || msgs[1].ID != "m-2" {
+		t.Errorf("order = %s, %s; want m-1, m-2", msgs[0].ID, msgs[1].ID)
+	}
+}
+
 func TestGetMessageNon200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"nope"}`, http.StatusNotFound)

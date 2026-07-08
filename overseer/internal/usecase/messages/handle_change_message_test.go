@@ -2,6 +2,7 @@ package messages
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -197,6 +198,105 @@ func TestRedeliveryIsIdempotent(t *testing.T) {
 	}
 	if f.repo.Count() != 1 {
 		t.Errorf("repo rows = %d, want 1 (idempotent upsert)", f.repo.Count())
+	}
+}
+
+type auditCall struct {
+	token string
+	order entity.Order
+	msg   entity.EmailMessage
+}
+
+type stubAudit struct {
+	calls []auditCall
+	err   error
+}
+
+func (s *stubAudit) Execute(_ context.Context, token string, order entity.Order, msg entity.EmailMessage) ([]entity.Discrepancy, error) {
+	s.calls = append(s.calls, auditCall{token: token, order: order, msg: msg})
+	return nil, s.err
+}
+
+func TestAuditRunsAfterUpsert(t *testing.T) {
+	f := newFixture(t)
+	audit := &stubAudit{}
+	f.uc.Audit = audit
+
+	f.graph.MessagesByID["msg-2"] = entity.EmailMessage{
+		ID: "msg-2", ConversationID: "conv-1", From: "dana@delmar.com",
+		FromName: "Dana Delmar", WebLink: "https://outlook.example/msg-2",
+		CreatedDateTime: time.Now(),
+	}
+	if err := f.repo.Upsert(context.Background(), entity.Order{
+		AccountID: f.user.AccountID, UserID: f.user.ID,
+		ConversationID: "conv-1", CompanyName: "Delmar Tooling", OrderID: 4471,
+		Status: entity.OrderStatusConfirmed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.llm.Extractions["conv-1"] = entity.OrderExtraction{Status: entity.OrderStatusInTransit}
+
+	if _, err := f.uc.Execute(context.Background(), HandleInput{SubscriptionID: "sub-1", MessageID: "msg-2"}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(audit.calls) != 1 {
+		t.Fatalf("audit calls = %d, want 1", len(audit.calls))
+	}
+	call := audit.calls[0]
+	if call.token != "graph-tok" {
+		t.Errorf("audit token = %q, want the resolved user's graph token", call.token)
+	}
+	if call.order.ConversationID != "conv-1" || call.order.UserID != f.user.ID {
+		t.Errorf("audit order = %+v, want the saved conv-1 row", call.order)
+	}
+	if call.msg.ID != "msg-2" {
+		t.Errorf("audit msg = %q, want msg-2", call.msg.ID)
+	}
+}
+
+func TestAuditSkippedForNonOrder(t *testing.T) {
+	f := newFixture(t)
+	audit := &stubAudit{}
+	f.uc.Audit = audit
+
+	f.graph.MessagesByID["msg-junk"] = entity.EmailMessage{
+		ID: "msg-junk", ConversationID: "conv-junk", From: "news@saas.com",
+		CreatedDateTime: time.Now(),
+	}
+	f.llm.FilterResult = nil // classified as not an order
+
+	if _, err := f.uc.Execute(context.Background(), HandleInput{SubscriptionID: "sub-1", MessageID: "msg-junk"}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(audit.calls) != 0 {
+		t.Error("audit ran on a non-order conversation")
+	}
+}
+
+func TestAuditFailureDoesNotUndoOrder(t *testing.T) {
+	f := newFixture(t)
+	audit := &stubAudit{err: errors.New("llm 503")}
+	f.uc.Audit = audit
+
+	f.graph.MessagesByID["msg-1"] = entity.EmailMessage{
+		ID: "msg-1", ConversationID: "conv-new", From: "dana@delmar.com",
+		FromName: "Dana Delmar", CreatedDateTime: time.Now(),
+	}
+	f.llm.FilterResult = []string{"conv-new"}
+	f.llm.Extractions["conv-new"] = entity.OrderExtraction{
+		CompanyName: "Delmar Tooling", OrderID: 4471, Status: entity.OrderStatusConfirmed,
+	}
+
+	_, err := f.uc.Execute(context.Background(), HandleInput{SubscriptionID: "sub-1", MessageID: "msg-1"})
+	if err == nil {
+		t.Fatal("want audit error surfaced to the caller's log")
+	}
+	if f.repo.Count() != 1 {
+		t.Error("audit failure lost the order upsert")
+	}
+	if len(f.events.OfType(entity.EventOrderUpdated)) != 1 {
+		t.Error("audit failure suppressed order.updated")
 	}
 }
 

@@ -44,3 +44,32 @@ type OrderRepo interface {
 type EventPublisher interface {
 	Publish(e entity.Event)
 }
+
+// ThreadFetcher is the slice of gateway/graph the Audit needs: conversation
+// history is re-fetched from Graph at audit time (no messages table; Graph
+// is the source of truth).
+type ThreadFetcher interface {
+	// ListConversationMessages returns every message in the conversation,
+	// oldest → newest.
+	ListConversationMessages(ctx context.Context, accessToken, conversationID string) ([]entity.EmailMessage, error)
+}
+
+// DiscrepancyLLM is the slice of gateway/llm the Audit needs.
+type DiscrepancyLLM interface {
+	// FindDiscrepancies compares the new message against the conversation
+	// history and returns zero or more findings.
+	FindDiscrepancies(ctx context.Context, newMsg entity.EmailMessage, history []entity.EmailMessage) ([]entity.DiscrepancyFinding, error)
+}
+
+// DiscrepancyRepo is the discrepancies-table port. Every query filters by owner.
+type DiscrepancyRepo interface {
+	// Insert stores a finding and returns the stored row (server-minted id,
+	// timestamps) so events carry the authoritative row.
+	Insert(ctx context.Context, d entity.Discrepancy) (entity.Discrepancy, error)
+	// ListByUser returns the user's discrepancies, newest first, optionally
+	// filtered by status (nil = all).
+	ListByUser(ctx context.Context, userID uuid.UUID, status *entity.DiscrepancyStatus) ([]entity.Discrepancy, error)
+	// UpdateStatus sets the status of the user's discrepancy; found=false
+	// when no such row belongs to the user.
+	UpdateStatus(ctx context.Context, userID, id uuid.UUID, s entity.DiscrepancyStatus) (entity.Discrepancy, bool, error)
+}

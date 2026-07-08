@@ -26,6 +26,7 @@ type env struct {
 	graph  *testutil.FakeGraph
 	llm    *testutil.FakeLLM
 	repo   *testutil.InMemOrders
+	discs  *testutil.InMemDiscrepancies
 	events *testutil.EventRecorder
 }
 
@@ -36,6 +37,7 @@ func newEnv(t *testing.T) *env {
 	graph := &testutil.FakeGraph{}
 	llm := &testutil.FakeLLM{}
 	repo := testutil.NewInMemOrders()
+	discs := testutil.NewInMemDiscrepancies()
 	events := &testutil.EventRecorder{}
 	log := slog.New(slog.DiscardHandler)
 
@@ -51,12 +53,17 @@ func newEnv(t *testing.T) *env {
 	e := NewRouter(RouterDeps{
 		Resolver: testutil.StaticResolver{User: user},
 		Orders:   controller,
-		WS:       noopWS{},
+		Discrepancies: &DiscrepanciesController{
+			List:   &orders.ListDiscrepancies{Repo: discs},
+			Update: &orders.UpdateDiscrepancyStatus{Repo: discs},
+			Log:    log,
+		},
+		WS: noopWS{},
 	})
 
 	srv := httptest.NewServer(e)
 	t.Cleanup(srv.Close)
-	return &env{srv: srv, user: user, graph: graph, llm: llm, repo: repo, events: events}
+	return &env{srv: srv, user: user, graph: graph, llm: llm, repo: repo, discs: discs, events: events}
 }
 
 type noopWS struct{}
