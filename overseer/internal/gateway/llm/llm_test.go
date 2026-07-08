@@ -52,6 +52,59 @@ func TestToFindingsEmptyIsClean(t *testing.T) {
 	}
 }
 
+func rankCandidates() []entity.DriveItem {
+	return []entity.DriveItem{
+		{ID: "item-0", Name: "Orders 2026.xlsx", WebURL: "https://onedrive.example/orders"},
+		{ID: "item-1", Name: "PO_Log.xlsx", WebURL: "https://onedrive.example/po-log"},
+		{ID: "item-2", Name: "Holiday photos", WebURL: "https://onedrive.example/photos"},
+		{ID: "item-3", Name: "Delmar quotes.xlsx", WebURL: "https://onedrive.example/delmar"},
+	}
+}
+
+func TestToRankedResolvesIndexes(t *testing.T) {
+	out := rankResult{Rankings: []ranking{
+		{Explanation: "vendor-named order log", CandidateIndex: 3},
+		{Explanation: "generic PO log", CandidateIndex: 1},
+	}}
+	got, err := toRanked(out, rankCandidates())
+	if err != nil {
+		t.Fatalf("toRanked: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "item-3" || got[1].ID != "item-1" {
+		t.Errorf("ranked = %+v", got)
+	}
+}
+
+func TestToRankedDedupesAndCapsAtThree(t *testing.T) {
+	out := rankResult{Rankings: []ranking{
+		{CandidateIndex: 0}, {CandidateIndex: 0}, // duplicate collapses
+		{CandidateIndex: 1}, {CandidateIndex: 2}, {CandidateIndex: 3},
+	}}
+	got, err := toRanked(out, rankCandidates())
+	if err != nil {
+		t.Fatalf("toRanked: %v", err)
+	}
+	if len(got) != 3 || got[0].ID != "item-0" || got[1].ID != "item-1" || got[2].ID != "item-2" {
+		t.Errorf("ranked = %+v", got)
+	}
+}
+
+func TestToRankedRejectsBadIndex(t *testing.T) {
+	for _, idx := range []int{-1, 4} {
+		out := rankResult{Rankings: []ranking{{CandidateIndex: idx}}}
+		if _, err := toRanked(out, rankCandidates()); err == nil {
+			t.Errorf("index %d: want validation error, got nil", idx)
+		}
+	}
+}
+
+func TestToRankedEmptyIsValid(t *testing.T) {
+	got, err := toRanked(rankResult{}, rankCandidates())
+	if err != nil || len(got) != 0 {
+		t.Fatalf("got %v, %v; want empty, nil", got, err)
+	}
+}
+
 func TestToFindingsRejectsBadOutput(t *testing.T) {
 	cases := map[string]func(f *finding){
 		"empty title":        func(f *finding) { f.Title = "" },

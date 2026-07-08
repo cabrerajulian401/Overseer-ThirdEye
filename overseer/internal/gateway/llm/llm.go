@@ -440,6 +440,127 @@ func toFindings(out findingsResult, history []entity.EmailMessage) ([]entity.Dis
 	return findings, nil
 }
 
+// --- RankDestinations ---------------------------------------------------------
+
+const rankSystemPrompt = `You pick where a wholesale distributor's purchase order should be recorded.
+Input: JSON with "fields" (the structured order extracted from the email thread) and "candidates" (OneDrive files found by searching for the supplier, the PO number, and generic order-log names; each carries its index).
+Rank the candidates that plausibly ARE the operator's order log for this purchase: order/PO trackers, vendor spreadsheets, purchase logs. Exclude files that are clearly something else (photos, contracts, unrelated documents).
+Return UP TO THREE rankings, best first, each naming the candidate by its index. State the explanation first, then the index. If no candidate is plausible, return an empty list.`
+
+var rankSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"rankings": map[string]any{
+			"type": "array",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"explanation":    map[string]any{"type": "string"},
+					"candidateIndex": map[string]any{"type": "integer"},
+				},
+				"required":             []string{"explanation", "candidateIndex"},
+				"additionalProperties": false,
+			},
+		},
+	},
+	"required":             []string{"rankings"},
+	"additionalProperties": false,
+}
+
+type ranking struct {
+	Explanation    string `json:"explanation"`
+	CandidateIndex int    `json:"candidateIndex"`
+}
+
+type rankResult struct {
+	Rankings []ranking `json:"rankings"`
+}
+
+// extractionPayload is the camelCase JSON view of an extraction the ranking
+// and planning prompts share. Dates format as YYYY-MM-DD.
+func extractionPayload(f entity.OrderExtraction) map[string]any {
+	dateStr := func(t *time.Time) any {
+		if t == nil {
+			return nil
+		}
+		return t.Format("2006-01-02")
+	}
+	return map[string]any{
+		"companyName":     f.CompanyName,
+		"emailAddress":    f.EmailAddress,
+		"orderId":         f.OrderID,
+		"status":          string(f.Status),
+		"originalEstDate": dateStr(f.OriginalEstDate),
+		"currentEstDate":  dateStr(f.CurrentEstDate),
+		"lastMessenger":   f.LastMessenger,
+		"supportingQuote": f.SupportingQuote,
+	}
+}
+
+// RankDestinations picks the top-3 candidate files for this order. The model
+// sees indexes and names only; ids/urls resolve here, at the gateway
+// boundary, so the output is always a subset of the input.
+func (g *Gateway) RankDestinations(ctx context.Context, fields entity.OrderExtraction, candidates []entity.DriveItem) ([]entity.DriveItem, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	type candidatePayload struct {
+		Index int    `json:"index"`
+		Name  string `json:"name"`
+	}
+	cands := make([]candidatePayload, 0, len(candidates))
+	for i, c := range candidates {
+		cands = append(cands, candidatePayload{Index: i, Name: c.Name})
+	}
+	userMsg, err := json.Marshal(map[string]any{
+		"fields":     extractionPayload(fields),
+		"candidates": cands,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("llm: marshal rank payload: %w", err)
+	}
+
+	var ranked []entity.DriveItem
+	err = g.callJSON(ctx, "RankDestinations", rankSystemPrompt, string(userMsg), rankSchema, func(raw []byte) error {
+		var out rankResult
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return fmt.Errorf("invalid JSON: %w", err)
+		}
+		rs, err := toRanked(out, candidates)
+		if err != nil {
+			return err
+		}
+		ranked = rs
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ranked, nil
+}
+
+// toRanked validates model output at the gateway boundary: indexes must
+// point into the candidates the model was shown; duplicates collapse; the
+// list caps at three (best first).
+func toRanked(out rankResult, candidates []entity.DriveItem) ([]entity.DriveItem, error) {
+	seen := make(map[int]bool, len(out.Rankings))
+	ranked := make([]entity.DriveItem, 0, 3)
+	for _, r := range out.Rankings {
+		if r.CandidateIndex < 0 || r.CandidateIndex >= len(candidates) {
+			return nil, fmt.Errorf("candidateIndex %d out of range", r.CandidateIndex)
+		}
+		if seen[r.CandidateIndex] {
+			continue
+		}
+		seen[r.CandidateIndex] = true
+		ranked = append(ranked, candidates[r.CandidateIndex])
+		if len(ranked) == 3 {
+			break
+		}
+	}
+	return ranked, nil
+}
+
 // --- shared plumbing ----------------------------------------------------------
 
 // callJSON makes one structured-output model call per attempt, validates the
