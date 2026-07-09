@@ -27,6 +27,15 @@ flowchart LR
     Graph -- "change notifications" --> HTTP
 ```
 
+## Video Demo of BE 
+
+
+<video src="https://github.com/user-attachments/assets/3164e5a3-67b0-4141-891d-084dac13eec2 controls width="600"></video>
+
+
+
+
+
 A core design decision: **mail is never stored**. Overseer keeps only derived state (orders, discrepancies, scans) in Postgres and re-fetches threads from Graph on demand. The mailbox stays the source of truth.
 
 ---
