@@ -30,7 +30,7 @@ flowchart LR
 ## Video Demo of BE 
 
 
-<video src="https://github.com/user-attachments/assets/3164e5a3-67b0-4141-891d-084dac13eec2 controls width="600"></video>
+<video src="https://github.com/user-attachments/assets/3164e5a3-67b0-4141-891d-084dac13eec2" controls width="600"></video>
 
 
 
