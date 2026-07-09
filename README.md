@@ -268,3 +268,239 @@ Every feature so far has followed the same build path, and it's all journaled: p
 - **Built:** Order List sync + live updates, Graph subscription lifecycle, Thread Audit, Otto scan/record, realtime channel.
 - **Next:** **Check-ups** — scheduled supplier follow-up emails, with cancel-on-reply hooking into the existing webhook job.
 - **Known MVP constraints:** single-user auth (any token resolves to the seeded user); Graph tokens cached in memory rather than a durable refresh-token flow; Otto scan runs synchronously.
+
+---
+
+## Guide: adding tests for a feature
+
+Every feature in this repo ships with the same three test layers, and none of them touch a database or the network — `make test` runs cold, fast, and deterministic.
+
+| Layer | What it proves | Where it lives |
+|---|---|---|
+| **Usecase unit test** | The business logic, against hand-written fakes of the usecase's own ports | Next to the usecase, e.g. [`record_order_test.go`](overseer/internal/usecase/otto/record_order_test.go) |
+| **Controller E2E test** | The full HTTP journey — real router, real auth middleware, real usecases; only the outermost adapters faked | [`overseer/internal/controller/http/*_e2e_test.go`](overseer/internal/controller/http/) |
+| **Gateway test** | The adapter speaks the external API's actual wire protocol | `httptest`-server tests, e.g. [`graph_test.go`](overseer/internal/gateway/graph/graph_test.go) |
+
+### The shared fake toolbox
+
+[`overseer/internal/testutil/fakes.go`](overseer/internal/testutil/fakes.go) holds one fake per outer adapter. They all follow the same design: **script the outputs with public fields, record the inputs in public slices/counters**, so tests read as *arrange → act → assert* with zero mock-framework ceremony.
+
+| Fake | Stands in for | Script fields → recorded calls |
+|---|---|---|
+| `FakeGraph` | Graph mail + subscriptions | `Messages`, `MessagesByID`, `ConversationsByID` → `GetCalls`, `ConversationsFetched`, `TokensSeen` |
+| `FakeLLM` | Claude | `FilterResult`, `Extractions`, `Findings`, `RankResult`, `PlanResult` → `ExtractCalls`, `PlanFieldsSeen`, … |
+| `FakeDrive` / `FakeExcel` | OneDrive / Excel | `SearchResults`, `RecentItems`, `Structures` → `QueriesSeen`, `Appends` |
+| `InMemOrders` / `InMemDiscrepancies` / `InMemOttoScans` / `InMemSubscriptions` | Postgres repos | seed via `Upsert`/`Insert`/`AddUser` → `Count()`, `All()` |
+| `EventRecorder` | The `/ws` hub | — → `Events`, `OfType(t)` |
+| `FakeTokens` / `StaticResolver` | Token cache / auth | `Put(userID, token)` / fixed `User` |
+
+### Anatomy of an E2E test
+
+`newEnv(t)` in [`orders_e2e_test.go`](overseer/internal/controller/http/orders_e2e_test.go) builds a fully wired `httptest.Server` — real `NewRouter`, real usecases, fakes at the edges — and hands back the `env` struct so your test can reach every fake. Two details make it deterministic: `Dispatch` runs jobs synchronously (no goroutine races), and `StaticResolver` mimics single-user auth.
+
+Adding a test to an existing feature is three steps: **seed the fakes, hit the endpoint, assert the body *and* the side effects**:
+
+```go
+func TestPostSync_SeedsOrderAndPublishesEvent(t *testing.T) {
+	e := newEnv(t)
+	// 1. Arrange: script what Graph and the LLM "would" return
+	e.graph.Messages = []entity.EmailMessage{
+		{ID: "m1", ConversationID: "conv-a", Subject: "PO #4471 confirmed"},
+	}
+	e.llm.FilterResult = []string{"conv-a"}
+	e.llm.Extractions = map[string]entity.OrderExtraction{
+		"conv-a": {CompanyName: "Delmar Tooling", OrderID: 4471, Status: entity.OrderStatusConfirmed},
+	}
+
+	// 2. Act: real HTTP through the real router + middleware
+	resp, _ := e.request(t, http.MethodPost, "/sync", true)
+
+	// 3. Assert: response AND side effects
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	if e.repo.Count() != 1 {
+		t.Errorf("orders = %d, want 1", e.repo.Count())
+	}
+	if got := e.events.OfType(entity.EventSyncCompleted); len(got) != 1 {
+		t.Errorf("sync.completed events = %d, want 1", len(got))
+	}
+}
+```
+
+### Per-feature seeding recipes
+
+- **Order List sync** — script `graph.Messages`, `llm.FilterResult`, `llm.Extractions` → `POST /sync` → assert `repo.Count()` and a `sync.completed` event.
+- **Webhook / live updates** — script `graph.MessagesByID`, register the user + subscription on `InMemSubscriptions`, cache a token with `FakeTokens.Put` (the webhook has no bearer of its own) → `POST /webhooks/graph` with a notification payload (`{"value":[{"subscriptionId":…,"clientState":…,"resourceData":{"id":…}}]}`) → assert the merge-upsert and the `order.updated` event. Always include the negative case: a wrong `clientState` must be dropped, not processed ([`webhooks_e2e_test.go`](overseer/internal/controller/http/webhooks_e2e_test.go) does exactly this).
+- **Thread Audit** — seed an existing order, script `graph.ConversationsByID` (the full thread) and `llm.Findings` keyed by the *new* message id → fire the webhook → assert `discs.Count()` and the `discrepancy.found` event.
+- **Otto scan** — script the thread + `llm.Extractions`, `drive.SearchResults`, `llm.RankResult` → `POST /otto/scans` → assert the response's `extractedFields`/`destinations` and that exactly one scan row exists. On failure paths, assert **no scan row leaked**.
+- **Otto record** — seed a scan directly on `InMemOttoScans`, script `excel.Structures`, `llm.PlanResult`, `drive.Items` → `POST /otto/scans/{id}/record` → assert `excel.Appends` got exactly the planned row and `llm.PlanFieldsSeen` saw the *user-edited* fields, not the stored ones. Then the contract cases: unknown scan → 404, second record → 409.
+
+### Checklist for a brand-new feature
+
+1. **Entity first** — add domain types + validators in `internal/entity` with table-driven tests (see [`discrepancy_test.go`](overseer/internal/entity/discrepancy_test.go)).
+2. **Usecase test-driven** — declare the ports the usecase needs in its own `ports.go`, fake them locally in the `_test.go`, and TDD the orchestration (partial failures, idempotent re-delivery, "LLM finishes before any write").
+3. **New gateway method?** Extend the real gateway with an `httptest`-server test asserting the exact request (path, query, body, auth header) — and mirror the method onto the matching `testutil` fake.
+4. **E2E** — add fields to the `env` struct, wire the controller in `newEnv`, then write the happy path + every documented error status.
+5. **Wire it in the composition root** — assign the real gateway/repo into the usecase's interface-typed fields in [`cmd/overseer/main.go`](overseer/cmd/overseer/main.go); that assignment is itself the compile-time conformance check, so signature drift between a port and its adapter fails the build.
+6. `make test && make vet` — still no DB, still no network.
+
+### The live LLM eval (the one test that costs money)
+
+[`filter_live_test.go`](overseer/internal/gateway/llm/filter_live_test.go) runs the **real model** against a fixture inbox built from production traffic — including the account-security junk mail that fooled the filter three times in the wild. It self-skips without a key:
+
+```sh
+cd overseer
+ANTHROPIC_API_KEY=sk-ant-... go test ./internal/gateway/llm -run TestFilterOrderMessagesLive -v
+```
+
+Run it whenever you touch a prompt in `gateway/llm` — prompt regressions don't show up in faked tests.
+
+---
+
+## Guide: trying it live with emails to yourself
+
+You can exercise every feature end-to-end against your own mailbox — no supplier required. You play both roles: the operator (via the API) and the supplier (via emails you send yourself).
+
+**You'll need:** a Microsoft account with Outlook + OneDrive, an Anthropic API key, `curl` + `jq`, and a websocket client (`npm i -g wscat`). A second email account (any Gmail works) makes the supplier side more realistic, but replying to yourself works too.
+
+### 1. Grab a Graph token
+
+Open [Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer), sign in with the Microsoft account, and copy the token from the **Access token** tab.
+
+- For the order list / audit features, consent to **`Mail.Read`**.
+- For Otto, you also need **`Files.ReadWrite`** — a mail-only token gets `403` on every OneDrive/Excel call (this has bitten before).
+- Tokens expire after ~1 hour. When calls start returning `401 InvalidAuthenticationToken`, grab a fresh one.
+
+```sh
+export TOKEN="<paste from Graph Explorer>"
+```
+
+### 2. Stage a supplier thread in your inbox
+
+Send yourself an email *as the supplier*, then keep **replying on the same thread** — replies share a `conversationId`, which is how Overseer groups a thread. A good script:
+
+> **Message 1 — the confirmation** (this becomes the order row)
+> Subject: `PO #4471 — Order Confirmation`
+> Body: *"Hi, confirming your order PO #4471: 500 units of 3/8" carbide inserts at $4.20/unit. Estimated delivery August 15, 2026. — Dana, Delmar Tooling"*
+>
+> **Message 2 — the slip** (reply; this is audit bait: a `date` discrepancy)
+> *"Quick update — the carbide inserts are now estimated for August 29 due to a mill delay."*
+>
+> **Message 3 — the price bump** (reply; a `price` discrepancy)
+> *"Also flagging: material surcharge brings the unit price to $4.85."*
+
+### 3. Boot the stack
+
+```sh
+cd overseer
+cp .env.example .env      # fill in ANTHROPIC_API_KEY
+make db-up
+make run                  # migrations auto-apply, serves :8080
+```
+
+### 4. Open the realtime channel
+
+In a second terminal — every pipeline announces its results here:
+
+```sh
+wscat -c ws://localhost:8080/ws -H "Authorization: Bearer $TOKEN"
+```
+
+### 5. Run the onboarding sync (Feature: Order List)
+
+```sh
+curl -s -X POST localhost:8080/sync -H "Authorization: Bearer $TOKEN"
+# → 202 {"syncId": "..."}  ... then "sync.completed" appears on the websocket
+curl -s "localhost:8080/orders" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+You should see your Delmar Tooling thread as an order — and your real inbox noise filtered out. If the filter misjudges something, set `LOG_LEVEL="debug"` in `.env` and rerun to see the raw LLM responses. **Side effect you want:** this authed call also fills the in-memory token cache, which the webhook pipeline needs (step 6).
+
+### 6. Live updates (Feature: Post-Sync) — two ways
+
+**Option A — real webhooks (needs a public URL).** Graph must reach your machine to validate the subscription, so tunnel first:
+
+```sh
+ngrok http 8080          # or: cloudflared tunnel --url http://localhost:8080
+# set PUBLIC_BASE_URL="https://<tunnel-host>" in .env, restart make run
+curl -s -X POST localhost:8080/subscriptions -H "Authorization: Bearer $TOKEN"
+```
+
+Now every new mail fires the pipeline for real: send yourself Message 2 and watch `order.updated` arrive on the websocket.
+
+**Option B — simulated notification (no tunnel).** Skip Graph's delivery and POST the notification yourself; everything downstream (real Graph fetch, real LLM, real DB write) still runs. First seed a subscription row so the webhook can resolve a user:
+
+```sh
+docker compose exec postgres psql -U postgres overseer -c \
+  "INSERT INTO graph_subscriptions (user_id, graph_subscription_id, expires_at)
+   SELECT id, 'sub-local-1', now() + interval '2 days' FROM users LIMIT 1;"
+```
+
+Get the real id of the new message (send Message 2, then in Graph Explorer run `GET /me/messages?$top=3&$select=id,subject,conversationId`), and fire:
+
+```sh
+curl -s -X POST localhost:8080/webhooks/graph -H "Content-Type: application/json" -d '{
+  "value": [{
+    "subscriptionId": "sub-local-1",
+    "changeType": "created",
+    "clientState": "overseer-dev-client-state",
+    "resourceData": { "id": "<real-message-id>" }
+  }]
+}'
+```
+
+`clientState` must match `GRAPH_CLIENT_STATE` (default above) or the notification is dropped as spoofed — try a wrong value once to see it. Remember the token cache is in-memory: **after any server restart, make one authed call (e.g. re-run `/sync`) before firing notifications**, or the job has no Graph token and skips.
+
+### 7. Trip the auditor (Feature: Thread Audit)
+
+Send Message 3 (the price bump), fire its notification (or let the real webhook deliver it), and watch `discrepancy.found` on the websocket:
+
+```sh
+curl -s "localhost:8080/discrepancies?status=open" -H "Authorization: Bearer $TOKEN" | jq
+curl -s -X PATCH localhost:8080/discrepancies/<id> \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"resolved"}'
+```
+
+The finding carries the metric (`price`), priority, the supporting quotes from both messages, and a deep link back to the email.
+
+### 8. Record it with Otto (Feature: Otto) — needs the `Files.ReadWrite` token
+
+In OneDrive, create `Orders.xlsx` and give it a **real Excel table** (select your header row — e.g. `PO | Supplier | Price | ETA` — then *Insert → Table*): the Excel API appends to tables, not loose cells. Naming it something like `Delmar orders.xlsx` helps, since Otto searches OneDrive by supplier name and PO number.
+
+```sh
+# Scan: extract + suggest destinations (messageId/conversationId from Graph Explorer)
+curl -s -X POST localhost:8080/otto/scans \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"messageId":"<real-message-id>","conversationId":"<real-conversation-id>"}' | jq
+
+# Record: YOU approve — edit any field, pick a destination id from the scan response
+curl -s -X POST localhost:8080/otto/scans/<scanId>/record \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"selectedResource":"<drive-item-id>","fields":{"companyName":"Delmar Tooling Inc.","orderId":4471,"status":"confirmed"}}' | jq
+```
+
+Open the returned `webUrl` — your row is in the sheet, with exactly the values you approved. Recording the same scan twice returns `409`.
+
+### 9. Verify in Postgres
+
+```sh
+docker compose exec postgres psql -U postgres overseer
+```
+
+```sql
+SELECT company_name, order_id, status, current_est_date FROM orders;
+SELECT discrepancy_title, priority, status FROM discrepancies;
+SELECT status, selected_resource FROM otto_scans;
+```
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `401 InvalidAuthenticationToken` from Graph | Token expired (~1 h) — grab a fresh one from Graph Explorer |
+| `403` on `/otto/scans` | Token lacks `Files.ReadWrite` — re-consent in Graph Explorer |
+| Webhook returns `202` but nothing happens | Check server logs: `clientState mismatch` (wrong secret), `skipped_unknown_subscription` (no `graph_subscriptions` row), or empty token cache (make an authed call after every restart) |
+| `/sync` finds none of your emails | The LLM filter judged them non-orders — make the supplier email more explicit (PO number, quantities, price) and check `LOG_LEVEL=debug` output |
+| `POST /subscriptions` fails | Graph couldn't validate the webhook — `PUBLIC_BASE_URL` must be reachable from the internet (tunnel running, value matches) |
