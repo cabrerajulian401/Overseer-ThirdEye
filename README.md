@@ -28,6 +28,11 @@ flowchart LR
     OV -->|"updated orders"| PG
     PG -->|"get orders"| OV
     MSG -.->|"new mail"| OV
+
+    classDef service fill:#d9d9d9,stroke:#8c8c8c,color:#333
+    classDef frontend fill:#ffe066,stroke:#c9a227,color:#333
+    class MSG,CLAUDE,PG service
+    class Loki frontend
 ```
 
 Two flows: **user-driven** — Loki calls the API, a usecase reads mail and files from Graph, asks Claude to make sense of them, saves the result to Postgres, and announces it on the websocket. **Mail-driven** — Microsoft pushes a new-mail notification, a background job updates the order and runs the audit, and the events reach Loki without anyone asking.
