@@ -22,9 +22,12 @@ flowchart LR
         WS["WebSocket hub"]
     end
 
-    MSG["Microsoft Graph<br/>Mail · OneDrive · Excel"]
-    CLAUDE["Claude"]
-    PG[("Postgres")]
+    subgraph Services["External services"]
+        direction TB
+        MSG["Microsoft Graph<br/>the inbox · OneDrive · Excel"]
+        CLAUDE["Claude<br/>reads & extracts order facts"]
+        PG[("Postgres<br/>orders · findings · scans")]
+    end
 
     Loki -->|"REST"| HTTP
     HTTP --> UC
