@@ -15,7 +15,7 @@ Here is the whole system in one picture. **Solid arrows are calls; dotted arrows
 ```mermaid
 %%{init: {"themeVariables": {"fontSize": "12px"}}}%%
 flowchart LR
-    Loki["Loki<br/>Outlook add-in"]
+    Loki["Loki<br/>Frontend"]
     OV["Overseer<br/>Go backend"]
     MSG["Microsoft Graph"]
     CLAUDE["Claude"]
@@ -23,9 +23,10 @@ flowchart LR
 
     Loki -->|"REST"| OV
     OV -.->|"events/updates"| Loki
-    OV -->|"old mail"| MSG
+    MSG -->|"old mail"| OV
     OV <-->|"inspect mail"| CLAUDE
     OV -->|"updated orders"| PG
+    PG -->|"get orders"| OV
     MSG -.->|"new mail"| OV
 ```
 
