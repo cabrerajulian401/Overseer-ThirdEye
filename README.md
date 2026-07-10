@@ -15,28 +15,17 @@ Here is the whole system in one picture. **Solid arrows are calls; dotted arrows
 ```mermaid
 flowchart LR
     Loki["Loki<br/>Outlook add-in"]
+    OV["Overseer<br/>Go backend"]
+    MSG["Microsoft Graph"]
+    CLAUDE["Claude"]
+    PG[("Postgres")]
 
-    subgraph Overseer["Overseer (Go)"]
-        HTTP["HTTP API"]
-        UC["Usecases"]
-        WS["WebSocket hub"]
-    end
-
-    subgraph Services["External services"]
-        direction TB
-        MSG["Microsoft Graph<br/>the inbox · OneDrive · Excel"]
-        CLAUDE["Claude<br/>reads & extracts order facts"]
-        PG[("Postgres<br/>orders · findings · scans")]
-    end
-
-    Loki -->|"REST"| HTTP
-    HTTP --> UC
-    UC --> MSG
-    UC --> CLAUDE
-    UC --> PG
-    UC --> WS
-    WS -.->|"live events"| Loki
-    MSG -.->|"new mail"| HTTP
+    Loki -->|"REST"| OV
+    OV -.->|"live events"| Loki
+    OV --> MSG
+    OV --> CLAUDE
+    OV --> PG
+    MSG -.->|"new mail"| OV
 ```
 
 Two flows: **user-driven** — Loki calls the API, a usecase reads mail and files from Graph, asks Claude to make sense of them, saves the result to Postgres, and announces it on the websocket. **Mail-driven** — Microsoft pushes a new-mail notification, a background job updates the order and runs the audit, and the events reach Loki without anyone asking.
