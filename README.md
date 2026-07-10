@@ -13,6 +13,7 @@ The problem it solves: when you buy from suppliers, everything about your orders
 Here is the whole system in one picture. **Solid arrows are calls; dotted arrows are pushes** that arrive on their own.
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "12px"}}}%%
 flowchart LR
     Loki["Loki<br/>Outlook add-in"]
     OV["Overseer<br/>Go backend"]
@@ -21,10 +22,10 @@ flowchart LR
     PG[("Postgres")]
 
     Loki -->|"REST"| OV
-    OV -.->|"live events"| Loki
-    OV --> MSG
-    OV --> CLAUDE
-    OV --> PG
+    OV -.->|"events/updates"| Loki
+    OV -->|"old mail"| MSG
+    OV <-->|"inspect mail"| CLAUDE
+    OV -->|"updated orders"| PG
     MSG -.->|"new mail"| OV
 ```
 
