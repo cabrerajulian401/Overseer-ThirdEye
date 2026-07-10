@@ -10,30 +10,44 @@ The problem it solves: when you buy from suppliers, everything about your orders
 
 > **Who's who:** **Scout** is the product · **Overseer** is this backend · **Loki** is the Outlook add-in UI (separate repo) · **Otto** is the email→spreadsheet feature.
 
-Here is the whole system in one picture. The add-in talks to Overseer over HTTP. Overseer talks to Microsoft Graph for email and files, to Claude for understanding text, and to Postgres for storage. Live updates flow back to the add-in over a single websocket.
+Here is the whole system in one picture. **Solid arrows are calls; dotted arrows are pushes** that arrive on their own (a new-mail notification coming in, a live event going out).
 
 ```mermaid
 flowchart LR
     Loki["Loki<br/>Outlook add-in (React)"]
-    subgraph Overseer["Overseer (Go)"]
-        HTTP["Echo HTTP API"]
-        WS["WebSocket hub"]
-        UC["Usecases"]
-        W["Subscription renewal worker"]
+
+    subgraph Overseer["Overseer (Go backend)"]
+        HTTP["HTTP API<br/>Echo router + auth"]
+        WH["Webhook endpoint<br/>POST /webhooks/graph"]
+        W["Renewal worker<br/>runs hourly"]
+        UC["Usecases<br/>all business logic"]
+        GW["Gateways<br/>graph · drive · excel · llm"]
+        REPO["Repo<br/>all SQL"]
+        WS["WebSocket hub<br/>GET /ws"]
     end
-    Graph["Microsoft Graph<br/>Mail · OneDrive · Excel · Webhooks"]
-    LLM["Anthropic Claude"]
+
+    MSG["Microsoft Graph<br/>Mail · OneDrive · Excel"]
+    CLAUDE["Anthropic Claude"]
     PG[("Postgres")]
 
-    Loki -- "REST + Bearer token" --> HTTP
-    WS -- "typed events" --> Loki
-    HTTP --> UC
-    W --> UC
-    UC --> Graph
-    UC --> LLM
-    UC --> PG
-    Graph -- "change notifications" --> HTTP
+    Loki -->|"REST + Bearer token"| HTTP
+    HTTP -->|"hands work to"| UC
+    MSG -.->|"new-mail notification"| WH
+    WH -->|"runs background job"| UC
+    W -->|"renews expiring subscriptions"| UC
+    UC --> GW
+    GW -->|"read mail · search OneDrive · append Excel rows"| MSG
+    GW -->|"filter · extract · rank · plan"| CLAUDE
+    UC --> REPO
+    REPO -->|"orders · discrepancies · otto_scans"| PG
+    UC -->|"publishes events"| WS
+    WS -.->|"sync.completed · order.updated · discrepancy.found"| Loki
 ```
+
+Two flows to follow through the diagram:
+
+1. **User-driven (starts at Loki):** the add-in calls the HTTP API → a usecase does the work — reading mail or files through the gateways, asking Claude to filter/extract/rank/plan, saving the results through the repo — and announces the outcome as an event on the websocket.
+2. **Mail-driven (starts at Microsoft Graph):** a new email arrives → Microsoft pushes a notification to the webhook endpoint → a background job classifies the message, updates its order, and runs the audit → `order.updated` and any `discrepancy.found` events reach the add-in without anyone asking. The hourly worker keeps Microsoft's subscription from expiring, so this flow never silently stops.
 
 ## Video demo (backend)
 
