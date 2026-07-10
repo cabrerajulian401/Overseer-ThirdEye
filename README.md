@@ -1,8 +1,16 @@
 # Overseer
 
-**Overseer** is the Go backend for **Scout** — ThirdEye's procurement AI assistant for wholesale distributors. It watches an operator's Outlook inbox through Microsoft Graph, uses Claude to turn messy supplier email threads into structured order data, and hands the operator a live order list, discrepancy alerts, and one-click ERP entry — all inside Outlook.
+**Overseer** is the backend server behind **Scout** — ThirdEye's AI assistant for purchasing teams at wholesale distributors.
 
-> **Naming cheat sheet:** **Scout** is the product · **Overseer** is this backend · **Loki** is the Outlook add-in UI (separate repo) · **Otto** is the email→ERP hero feature.
+The problem it solves: when you buy from suppliers, everything about your orders — confirmations, delays, price changes — lives buried in email threads. Overseer reads those emails (through Microsoft Graph), understands them (with Claude), and turns them into three things the operator sees right inside Outlook:
+
+1. **A live list of every open order**, built from the inbox and kept up to date automatically.
+2. **Alerts when a supplier quietly changes something** — a price bump, a slipped delivery date, a smaller quantity.
+3. **One-click order entry**: log an order into the right Excel spreadsheet without retyping it.
+
+> **Who's who:** **Scout** is the product · **Overseer** is this backend · **Loki** is the Outlook add-in UI (separate repo) · **Otto** is the email→spreadsheet feature.
+
+Here is the whole system in one picture. The add-in talks to Overseer over HTTP. Overseer talks to Microsoft Graph for email and files, to Claude for understanding text, and to Postgres for storage. Live updates flow back to the add-in over a single websocket.
 
 ```mermaid
 flowchart LR
@@ -27,58 +35,66 @@ flowchart LR
     Graph -- "change notifications" --> HTTP
 ```
 
-## Video Demo of BE 
-
+## Video demo (backend)
 
 <video src="https://github.com/user-attachments/assets/3164e5a3-67b0-4141-891d-084dac13eec2" controls width="600"></video>
 
+**One key design decision: Overseer never stores your email.** It only stores what it *derives* from email — orders, alerts, scan results. Whenever it needs the original messages again, it re-fetches them from Microsoft. Your mailbox stays the single source of truth.
 
+## Contents
 
-
-
-A core design decision: **mail is never stored**. Overseer keeps only derived state (orders, discrepancies, scans) in Postgres and re-fetches threads from Graph on demand. The mailbox stays the source of truth.
+- [What Overseer does (the features)](#what-overseer-does-the-features)
+- [The API](#the-api)
+- [How the code is organized](#how-the-code-is-organized)
+- [Running it locally](#running-it-locally)
+- [Testing](#testing)
+- [Repository map](#repository-map)
+- [Status & roadmap](#status--roadmap)
+- [Guide: adding tests for a feature](#guide-adding-tests-for-a-feature)
+- [Guide: trying it live with emails to yourself](#guide-trying-it-live-with-emails-to-yourself)
 
 ---
 
-## Features
+## What Overseer does (the features)
 
-| Feature | What it does | Status |
+| Feature | In one sentence | Status |
 |---|---|---|
-| **Order List — Sync** | One-time onboarding backfill: reads ~30 days of inbox, LLM-filters to order threads, extracts structured fields per thread | ✅ Built |
-| **Order List — Live** | Graph webhooks keep the list current: every new supplier email is classified, extracted, and merged into its order in real time | ✅ Built |
-| **Otto — email → ERP** | Extracts an order from a thread, finds the right spreadsheet in OneDrive, and — after human approval — appends the row to Excel | ✅ Built |
-| **Thread Audit** | On every new message in a known order thread, compares it against the full history and flags discrepancies (price / date / unit) | ✅ Built |
-| **Check-ups** | Scheduled follow-up emails to suppliers | 🔜 Specced, not yet built |
+| **Order List — first sync** | Reads ~30 days of inbox once and builds the initial order list | ✅ Built |
+| **Order List — live updates** | Every new supplier email updates its order in real time | ✅ Built |
+| **Otto — email → spreadsheet** | Extracts an order, finds the right Excel file, and (after you approve) writes the row | ✅ Built |
+| **Thread Audit** | Compares each new message against the thread's history and flags changes | ✅ Built |
+| **Check-ups** | Scheduled follow-up emails to suppliers | 🔜 Specced, not built yet |
 
-### Order List — Onboarding Sync
+### 1. Order List — the first sync
 
-`POST /sync` returns `202 {syncId}` immediately and runs the backfill in the background:
+When a user first connects, Overseer builds their order list from scratch. The add-in calls `POST /sync`, gets an immediate `202` reply, and the work runs in the background:
 
-1. `graph.ListMessages` pulls the last 30 days of inbox.
-2. `llm.FilterOrderMessages` keeps only order-related conversations (one cheap pass over the whole batch).
-3. Messages are grouped into threads; `llm.ExtractOrderFields` pulls supplier, PO number, status, estimated dates, and a supporting quote from each.
-4. Orders are upserted idempotently on `(user_id, conversation_id)` — all LLM work finishes before any DB write, so a failed sync never leaves a partial seed.
-5. A `sync.completed` event lands on the websocket.
+1. Fetch the last 30 days of the inbox from Microsoft Graph.
+2. Ask Claude which conversations are actually about orders. This is one cheap pass over the whole batch — newsletters, receipts, and other noise are dropped here.
+3. Group the surviving messages into threads, then ask Claude to extract the facts from each thread: supplier name, PO number, order status, estimated delivery dates, and a quote from the email that backs it all up.
+4. Save each thread as one row in the `orders` table. Two safety properties here: running sync twice never creates duplicates (each order is keyed by its email conversation, so it updates in place), and nothing is written to the database until *all* the AI work has succeeded — a failed sync can't leave behind a half-finished list.
+5. Announce `sync.completed` on the websocket so the UI knows to refresh.
 
-The list is then served by `GET /orders` with status filtering and cursor pagination.
+From then on, `GET /orders` serves the list, with status filtering and pagination.
 
-- Usecase: [`overseer/internal/usecase/orders/build_active_order_list.go`](overseer/internal/usecase/orders/build_active_order_list.go), [`format_initial_order_data.go`](overseer/internal/usecase/orders/format_initial_order_data.go)
+Code: [`build_active_order_list.go`](overseer/internal/usecase/orders/build_active_order_list.go), [`format_initial_order_data.go`](overseer/internal/usecase/orders/format_initial_order_data.go)
 
-### Order List — Live updates (Post-Sync)
+### 2. Order List — staying up to date
 
-`POST /subscriptions` registers a Microsoft Graph change-notification subscription for the user's inbox. From then on:
+After the first sync, the list keeps itself current using Microsoft's **webhooks** (push notifications for new mail):
 
-1. Graph POSTs to `POST /webhooks/graph` on every new message (authenticated by a shared `clientState` secret, not the bearer middleware). The handler echoes Graph's validation handshake and enqueues real notifications for background processing.
-2. `HandleChangeMessage` resolves the subscription to a user, fetches the message, classifies it if the conversation is unseen, extracts fields, and **merge-upserts** the order — new information folds in without clobbering existing fields.
-3. An `order.updated` event is pushed to the websocket, then the Audit leg runs (below).
+1. `POST /subscriptions` tells Microsoft: *"call me whenever this inbox gets a new message."*
+2. When mail arrives, Microsoft calls `POST /webhooks/graph`. This endpoint is protected by a shared secret (`clientState`) instead of a login token, because Microsoft doesn't have one. Overseer immediately replies "got it" and does the real work in the background.
+3. The background job figures out whose mailbox fired, fetches the new message, checks whether it's order-related, extracts the facts, and folds them into the existing order. New information updates fields — it never wipes out what was already known.
+4. An `order.updated` event goes out on the websocket, and the Thread Audit (feature 4) runs on the same thread.
 
-Graph subscriptions expire after ~3 days, so a background worker ticks hourly and renews anything within 12 h of expiry (TTL 48 h).
+One maintenance detail: Microsoft subscriptions expire after about 3 days. A background worker checks every hour and renews any subscription that's within 12 hours of expiring, so the pipeline never silently goes deaf.
 
-- Usecases: [`overseer/internal/usecase/messages/handle_change_message.go`](overseer/internal/usecase/messages/handle_change_message.go), [`overseer/internal/usecase/subscriptions/`](overseer/internal/usecase/subscriptions/)
+Code: [`handle_change_message.go`](overseer/internal/usecase/messages/handle_change_message.go), [`usecase/subscriptions/`](overseer/internal/usecase/subscriptions/)
 
-### Otto — email → ERP entry (human-in-the-loop)
+### 3. Otto — email → spreadsheet, with you in the loop
 
-Otto is a strict two-phase flow: **nothing is ever written to the ERP without explicit human approval.**
+Otto takes an order email and logs it into the operator's Excel sheet. The rule that shapes the whole design: **nothing is ever written to a spreadsheet without explicit human approval.** That's why Otto works in two separate steps — a *scan* that only reads, and a *record* that only happens after you confirm.
 
 ```mermaid
 sequenceDiagram
@@ -88,101 +104,117 @@ sequenceDiagram
     participant L as Claude
 
     U->>O: POST /otto/scans {messageId, conversationId}
-    O->>G: fetch thread
-    O->>L: extract order fields
-    O->>G: search OneDrive (supplier name, PO#, "orders", recents)
-    O->>L: rank top-3 destination spreadsheets
-    O-->>U: extracted fields + suggested destinations
-    Note over U: Human reviews & edits the confirm card
+    O->>G: fetch the email thread
+    O->>L: extract the order's fields
+    O->>G: search OneDrive (supplier name, PO#, "orders", recent files)
+    O->>L: rank the top-3 candidate spreadsheets
+    O-->>U: extracted fields + suggested spreadsheets
+    Note over U: You review and edit the fields, pick a spreadsheet
     U->>O: POST /otto/scans/{scanId}/record {selectedResource, fields}
-    O->>G: read workbook structure
-    O->>L: plan WHERE to append (never re-decides values)
-    O->>G: append table row
-    O-->>U: webUrl of the updated sheet
+    O->>G: read the workbook's structure
+    O->>L: plan WHERE the row goes (never changes the values)
+    O->>G: append the row
+    O-->>U: link to the updated sheet
 ```
 
-- **Scan** persists an `otto_scans` row so the record step operates only on what the user saw and approved.
-- **Record** replays *approved fields only* — the LLM plans placement (which table, column mapping) but the values written are exactly what the user confirmed. Recording twice returns `409`; an unknown scan returns `404`.
-- Usecases: [`overseer/internal/usecase/otto/resolve_destinations.go`](overseer/internal/usecase/otto/resolve_destinations.go), [`record_order.go`](overseer/internal/usecase/otto/record_order.go)
+**Step 1 — Scan** (`POST /otto/scans`): Otto reads the whole thread, extracts the order fields, searches the user's OneDrive for likely spreadsheets, and has Claude rank the three best candidates. The result is saved as a "scan" so step 2 can only ever act on what the user actually saw.
 
-### Thread Audit — discrepancy detection
+**Step 2 — Record** (`POST /otto/scans/{scanId}/record`): the user reviews the extracted fields (fixing anything wrong), picks a destination, and confirms. Claude's only job here is *placement* — which table, which value goes in which column. The values written are exactly what the user approved, character for character. The response includes a `webUrl` link so the user can open the sheet and see the new row.
 
-Audit has no infrastructure of its own; it rides the webhook job. When a new message arrives in a *known* order conversation:
+Guard rails: recording the same scan twice returns `409 Conflict`; recording a scan that doesn't exist returns `404`.
 
-1. `graph.ListConversationMessages` re-fetches the full thread.
-2. `llm.FindDiscrepancies` compares the new message against the history — did the price change? the date slip? the quantity shrink?
-3. Each finding is stored with a priority (`high`/`medium`/`low`), a metric type (`price`/`date`/`unit`), the supporting quotes, and a deep link back to the email — then pushed as a `discrepancy.found` event.
+Code: [`resolve_destinations.go`](overseer/internal/usecase/otto/resolve_destinations.go), [`record_order.go`](overseer/internal/usecase/otto/record_order.go)
 
-A clean thread stores nothing, and the first message of a conversation never audits (there's no history to contradict). Findings are listed via `GET /discrepancies` and cleared via `PATCH /discrepancies/{id}` (`open` → `resolved`/`dismissed`).
+### 4. Thread Audit — catching quiet changes
 
-- Usecase: [`overseer/internal/usecase/orders/catch_discrepancies.go`](overseer/internal/usecase/orders/catch_discrepancies.go)
+Suppliers change things mid-thread: *"quick update, delivery slipped two weeks"* or *"small surcharge, unit price is now $4.85."* These are easy to miss in a busy inbox. Audit catches them.
 
-### Realtime channel
+It has no infrastructure of its own — it runs inside the webhook job whenever a new message arrives in a thread Overseer already tracks:
 
-One websocket — `GET /ws` — carries every push the UI needs as typed events: `{"type": "...", "data": {...}}`. Current event types: `sync.completed`, `order.updated`, `discrepancy.found`. New features add event types, never new sockets. Clients only listen; inbound frames are discarded.
+1. Re-fetch the entire thread from Microsoft.
+2. Ask Claude: *compare this new message against the history. Did the price change? Did a date slip? Did a quantity shrink?*
+3. Store each finding with a priority (`high`/`medium`/`low`), a category (`price`/`date`/`unit`), the exact quotes from both emails that prove it, and a deep link back to the message — then announce it as a `discrepancy.found` event.
 
-### Auth (MVP)
+If nothing changed, nothing is stored. The first message of a thread is never audited (there's no history to contradict yet). The UI reads findings with `GET /discrepancies` and closes them with `PATCH /discrepancies/{id}` (`open` → `resolved` or `dismissed`).
 
-Every route except the webhook requires `Authorization: Bearer <Graph token>` — the add-in's own Graph-scoped token, passed straight through to Microsoft Graph. The MVP is single-user: any valid-looking token resolves to the seeded user, and the last-seen token is cached in memory so background jobs (webhooks, renewals) can call Graph on the user's behalf.
+Code: [`catch_discrepancies.go`](overseer/internal/usecase/orders/catch_discrepancies.go)
+
+### 5. The realtime channel
+
+All live updates reach the UI through **one** websocket: `GET /ws`. Every message on it has the same shape — `{"type": "...", "data": {...}}` — and there are three types today: `sync.completed`, `order.updated`, and `discrepancy.found`.
+
+The rule for growth: new features add new event *types*, never a second socket. The channel is one-way — the client only listens, and anything it sends is ignored.
+
+### 6. Login (the current MVP shortcut)
+
+Every route except the webhook requires `Authorization: Bearer <token>`, where the token is the add-in's own Microsoft Graph token — Overseer passes it straight through to Microsoft when it needs to read mail or files.
+
+For now the system is **single-user**: any valid-looking token resolves to the one seeded user. The most recent token is also kept in memory, so background jobs (webhook processing, subscription renewals) can call Microsoft on the user's behalf. A durable multi-user login comes later.
 
 ---
 
-## API surface
+## The API
 
-All routes live in [`overseer/internal/controller/http/router.go`](overseer/internal/controller/http/router.go).
+All routes are wired up in [`router.go`](overseer/internal/controller/http/router.go).
 
-| Method | Path | Purpose | Success |
+| Method | Path | What it does | Success |
 |---|---|---|---|
-| `POST` | `/sync` | Kick off onboarding inbox sync (async) | `202 {syncId}` |
-| `GET` | `/orders` | Order list — `?status=&cursor=&limit=` | `200 {orders, nextCursor}` |
+| `POST` | `/sync` | Start the first inbox sync (runs in background) | `202 {syncId}` |
+| `GET` | `/orders` | The order list — filter/paginate with `?status=&cursor=&limit=` | `200 {orders, nextCursor}` |
 | `GET` | `/ws` | The single realtime channel | `101` upgrade |
-| `POST` | `/subscriptions` | Create/replace the user's Graph subscription | `201` |
+| `POST` | `/subscriptions` | Create/replace the user's new-mail subscription | `201` |
 | `GET` | `/discrepancies` | List audit findings — `?status=` | `200` |
-| `PATCH` | `/discrepancies/:discrepancyId` | Update a finding's status | `200` |
-| `POST` | `/otto/scans` | Ask Otto: extract fields + top-3 destinations | `200` |
-| `POST` | `/otto/scans/:scanId/record` | Human-approved write to Excel | `200 {webUrl, status}` |
-| `POST` | `/webhooks/graph` | Graph change notifications (`clientState`-authed, no bearer) | `200` / `202` |
+| `PATCH` | `/discrepancies/:discrepancyId` | Resolve or dismiss a finding | `200` |
+| `POST` | `/otto/scans` | Otto step 1: extract fields + suggest spreadsheets | `200` |
+| `POST` | `/otto/scans/:scanId/record` | Otto step 2: human-approved write to Excel | `200 {webUrl, status}` |
+| `POST` | `/webhooks/graph` | Where Microsoft delivers new-mail notifications (secret-authed, no bearer) | `200` / `202` |
 
-Wire DTOs are camelCase and live in [`dto.go`](overseer/internal/controller/http/dto.go); `userId`/`accountId` always come from auth context, never the request body.
+Request and response fields are camelCase ([`dto.go`](overseer/internal/controller/http/dto.go)). Who you are always comes from the auth token — any `userId`/`accountId` in a request body is ignored.
 
 ---
 
-## Architecture
+## How the code is organized
 
 ### The one rule
+
+Every dependency points the same direction:
 
 ```
 controller / worker  →  usecase  →  gateway / repo
 ```
 
-Dependencies point inward, never back up. Each usecase package declares the small interfaces (**ports**) it needs in its own `ports.go`; gateways and repos satisfy them structurally and never import usecases. The composition root ([`overseer/cmd/overseer/main.go`](overseer/cmd/overseer/main.go)) is the only place layers are wired, and it carries compile-time conformance assertions (`var _ orders.MessageLister = (*graph.Client)(nil)`) so signature drift fails the build.
+In plain terms:
 
-### Layout
+- **Controllers** (HTTP handlers) and **workers** (background loops) receive work and hand it to a usecase. They hold no business logic.
+- **Usecases** hold *all* the business logic — every decision, every orchestration step, including the AI call sequences.
+- **Gateways** (Microsoft Graph, Claude, OneDrive, Excel) and **repos** (Postgres) just do what they're told: call an API, run a query. No decisions.
+
+A usecase never knows which concrete gateway it's talking to. It declares small interfaces (**ports**) in its own `ports.go` describing what it needs, and the real implementations are plugged in at startup in [`cmd/overseer/main.go`](overseer/cmd/overseer/main.go) — the only file where the layers meet. That plug-in is type-checked, so if a gateway's method signature ever drifts from what a usecase expects, the project stops compiling.
+
+### Folder layout
 
 ```
 overseer/
-├── cmd/overseer/            # composition root: config, wiring, workers
-├── db/migrations/           # dbmate migrations (also embedded, auto-applied at startup)
+├── cmd/overseer/            # startup: config, wiring, background workers
+├── db/migrations/           # database migrations (auto-applied at startup)
 └── internal/
-    ├── entity/              # domain types — no JSON/DB tags, stdlib + uuid only
+    ├── entity/              # core domain types — plain Go, no JSON/DB tags
     ├── usecase/
-    │   ├── orders/          # sync, list, audit, discrepancy status
-    │   ├── messages/        # webhook job (HandleChangeMessage)
-    │   ├── otto/            # scan (ResolveDestinations) + record (RecordOrder)
-    │   └── subscriptions/   # ensure + renew Graph subscriptions
+    │   ├── orders/          # first sync, order list, audit, finding status
+    │   ├── messages/        # the webhook background job
+    │   ├── otto/            # Otto scan + record
+    │   └── subscriptions/   # create + renew Microsoft subscriptions
     ├── gateway/
-    │   ├── graph/           # Microsoft Graph mail + subscriptions
-    │   ├── drive/           # OneDrive search / recents / item lookup
-    │   ├── excel/           # workbook structure + table row append
-    │   └── llm/             # Anthropic Claude: prompts, retries, validation, cost logging
-    ├── repo/                # Postgres via pgx — all SQL lives here
-    ├── controller/http/     # Echo router, auth middleware, controllers, DTOs
-    ├── controller/ws/       # realtime hub
-    ├── tokencache/          # in-memory per-user Graph token cache
-    └── testutil/            # shared fakes for E2E tests
+    │   ├── graph/           # Microsoft Graph: mail + subscriptions
+    │   ├── drive/           # OneDrive: search, recents, file lookup
+    │   ├── excel/           # Excel: read workbook structure, append rows
+    │   └── llm/             # Claude: prompts, retries, output validation
+    ├── repo/                # Postgres — every SQL statement lives here
+    ├── controller/http/     # HTTP router, auth middleware, handlers
+    ├── controller/ws/       # the websocket hub
+    ├── tokencache/          # in-memory Graph token cache
+    └── testutil/            # shared fakes used by the E2E tests
 ```
-
-Gateways are deliberately dumb adapters — no business decisions, no DB access. All orchestration (including the LLM agent loops) lives in usecases.
 
 ### Tech stack
 
@@ -191,35 +223,35 @@ Gateways are deliberately dumb adapters — no business decisions, no DB access.
 | Language | Go 1.26 |
 | HTTP | Echo v4 |
 | Realtime | gorilla/websocket |
-| Database | Postgres 16 (pgx v5 / pgxpool) |
+| Database | Postgres 16 (pgx v5) |
 | Migrations | dbmate (CLI + embedded at startup) |
 | LLM | Anthropic Go SDK — default model `claude-opus-4-8`, structured JSON output |
 | External API | Microsoft Graph v1.0 (mail, subscriptions, OneDrive, Excel) |
 
 ### Database
 
-Every domain table carries `account_id` + `user_id`. Migrations in [`overseer/db/migrations/`](overseer/db/migrations/) are the source of truth.
+Six tables. The migration files in [`overseer/db/migrations/`](overseer/db/migrations/) are the source of truth, and every domain table carries an `account_id` + `user_id`.
 
-| Table | Stores |
+| Table | What it stores |
 |---|---|
-| `accounts` | Tenant — the distributor company |
-| `users` | Operator whose mailbox is watched (unique email) |
-| `graph_subscriptions` | One Graph webhook subscription per user, with expiry for the renewal worker |
-| `orders` | Derived order list — keyed for upsert on `(user_id, conversation_id)`; supplier, PO number, status, original/current est. dates, last messenger, supporting quote |
-| `discrepancies` | Audit findings — status, priority, title, JSONB detail + quotes, email deep link |
-| `otto_scans` | One Ask-Otto interaction — extracted fields (JSONB), selected destination, status (`scanned`/`recorded`/`abandoned`) |
+| `accounts` | The customer company (the distributor) |
+| `users` | The operator whose mailbox is watched |
+| `graph_subscriptions` | The one active new-mail subscription per user, with its expiry (read by the renewal worker) |
+| `orders` | The derived order list — supplier, PO number, status, original + current estimated dates, supporting quote. One row per email conversation. |
+| `discrepancies` | Audit findings — status, priority, title, the supporting quotes, and an email deep link |
+| `otto_scans` | One Otto interaction — the extracted fields, the chosen spreadsheet, and its status (`scanned` / `recorded` / `abandoned`) |
 
-Domain enums (`OrderStatus`: `in_transit`/`confirmed`/`delivered`/`issue`, discrepancy status/priority/metric, scan status) are declared once in `internal/entity` and enforced both at the LLM boundary and as DB CHECK constraints.
+Allowed values (order status, finding priority, and so on) are declared once in `internal/entity` and enforced in two places: when validating Claude's output, and as CHECK constraints in the database.
 
 ---
 
-## Running it
+## Running it locally
 
 ```sh
 cd overseer
-cp .env.example .env         # fill in ANTHROPIC_API_KEY
-make db-up                   # Postgres via docker compose
-make run                     # migrations auto-apply, then serve :8080
+cp .env.example .env         # then fill in ANTHROPIC_API_KEY
+make db-up                   # start Postgres via docker compose
+make run                     # migrations auto-apply, server listens on :8080
 ```
 
 ### Configuration
@@ -228,26 +260,26 @@ make run                     # migrations auto-apply, then serve :8080
 |---|---|---|
 | `PORT` | `8080` | HTTP listen port |
 | `DATABASE_URL` | local Postgres DSN | Also read by the dbmate CLI |
-| `ANTHROPIC_API_KEY` | — (required) | LLM gateway |
-| `LLM_MODEL` | `claude-opus-4-8` | Model override |
-| `PUBLIC_BASE_URL` | `http://localhost:8080` | Where Graph reaches `/webhooks/graph` |
-| `GRAPH_CLIENT_STATE` | `overseer-dev-client-state` | Shared secret in every Graph notification |
-| `SEED_ACCOUNT_NAME` / `SEED_USER_EMAIL` | dev values | Single-user MVP seed |
-| `LOG_LEVEL` | `info` | `debug` logs raw LLM responses |
+| `ANTHROPIC_API_KEY` | — (required) | Key for the Claude API |
+| `LLM_MODEL` | `claude-opus-4-8` | Override the model |
+| `PUBLIC_BASE_URL` | `http://localhost:8080` | The address Microsoft uses to reach `/webhooks/graph` |
+| `GRAPH_CLIENT_STATE` | `overseer-dev-client-state` | Shared secret checked on every webhook delivery |
+| `SEED_ACCOUNT_NAME` / `SEED_USER_EMAIL` | dev values | The single seeded account/user |
+| `LOG_LEVEL` | `info` | Set to `debug` to log raw Claude responses |
 
-`make run` sources `.env`; the binary itself reads only real env vars (12-factor). Migrations also run standalone: `make migrate`, `make migrate-status`.
+`make run` loads `.env` for you; the binary itself only reads real environment variables. Migrations can also be run standalone: `make migrate`, `make migrate-status`.
 
 ### Testing
 
 ```sh
-make test    # no DB, no network
+make test    # fast and deterministic — no database, no network
 ```
 
-Three tiers:
+Three tiers of tests (the [testing guide below](#guide-adding-tests-for-a-feature) explains each in depth):
 
-- **Usecase unit tests** — every usecase tested against hand-written fakes of its ports.
-- **Controller E2E tests** — full HTTP request → response through the real router, middleware, and usecases, with only the outermost adapters faked (fake Graph/LLM/Drive/Excel, in-memory repos, event recorder). See `*_e2e_test.go` in [`overseer/internal/controller/http/`](overseer/internal/controller/http/).
-- **Live LLM eval** — [`filter_live_test.go`](overseer/internal/gateway/llm/filter_live_test.go) runs the real model against a production inbox fixture (including the account-security junk that fooled the filter in the wild); skipped unless `ANTHROPIC_API_KEY` is set.
+- **Usecase unit tests** — the business logic, tested against hand-written fakes.
+- **Controller E2E tests** — a real HTTP request through the real router and usecases, with only the outer edges (Microsoft, Claude, the database) faked.
+- **Live LLM eval** — one test that calls the real model against a fixture built from production traffic. It skips itself unless `ANTHROPIC_API_KEY` is set.
 
 ---
 
@@ -257,53 +289,53 @@ Three tiers:
 .
 ├── overseer/           # the Go backend (everything above)
 ├── docs/tech_spec.md   # the full Scout product & tech spec — the authoritative source
-├── .ai/                # ARCHITECTURE.md + Go code-organization conventions
+├── .ai/                # architecture map + Go code-organization conventions
 └── Building-Journal/   # per-feature build journals (sync, post-sync, audit, Otto)
 ```
 
-Every feature so far has followed the same build path, and it's all journaled: plan → entity + migration → gateway methods → repo → usecase → controller wiring → E2E test.
+Every feature so far has followed the same build path, journaled step by step: plan → entity + migration → gateway methods → repo → usecase → controller wiring → E2E test.
 
 ## Status & roadmap
 
-- **Built:** Order List sync + live updates, Graph subscription lifecycle, Thread Audit, Otto scan/record, realtime channel.
-- **Next:** **Check-ups** — scheduled supplier follow-up emails, with cancel-on-reply hooking into the existing webhook job.
-- **Known MVP constraints:** single-user auth (any token resolves to the seeded user); Graph tokens cached in memory rather than a durable refresh-token flow; Otto scan runs synchronously.
+- **Built:** the first sync, live updates, subscription lifecycle, Thread Audit, Otto scan/record, the realtime channel.
+- **Next:** **Check-ups** — scheduled follow-up emails to suppliers, with automatic cancellation when the supplier replies (hooks into the existing webhook job).
+- **Known MVP shortcuts:** single-user login (any token maps to the seeded user); Graph tokens live in memory and are lost on restart; Otto's scan runs synchronously.
 
 ---
 
 ## Guide: adding tests for a feature
 
-Every feature in this repo ships with the same three test layers, and none of them touch a database or the network — `make test` runs cold, fast, and deterministic.
+Every feature ships with the same three test layers, and none of them touch a database or the network — `make test` runs cold, fast, and deterministic.
 
 | Layer | What it proves | Where it lives |
 |---|---|---|
-| **Usecase unit test** | The business logic, against hand-written fakes of the usecase's own ports | Next to the usecase, e.g. [`record_order_test.go`](overseer/internal/usecase/otto/record_order_test.go) |
-| **Controller E2E test** | The full HTTP journey — real router, real auth middleware, real usecases; only the outermost adapters faked | [`overseer/internal/controller/http/*_e2e_test.go`](overseer/internal/controller/http/) |
-| **Gateway test** | The adapter speaks the external API's actual wire protocol | `httptest`-server tests, e.g. [`graph_test.go`](overseer/internal/gateway/graph/graph_test.go) |
+| **Usecase unit test** | The business logic is right, tested against fakes of the usecase's ports | Next to the usecase, e.g. [`record_order_test.go`](overseer/internal/usecase/otto/record_order_test.go) |
+| **Controller E2E test** | The full HTTP journey works — real router, real auth middleware, real usecases; only the outer edges faked | [`overseer/internal/controller/http/*_e2e_test.go`](overseer/internal/controller/http/) |
+| **Gateway test** | The adapter speaks the external API's actual wire format | `httptest`-server tests, e.g. [`graph_test.go`](overseer/internal/gateway/graph/graph_test.go) |
 
-### The shared fake toolbox
+### The shared fakes
 
-[`overseer/internal/testutil/fakes.go`](overseer/internal/testutil/fakes.go) holds one fake per outer adapter. They all follow the same design: **script the outputs with public fields, record the inputs in public slices/counters**, so tests read as *arrange → act → assert* with zero mock-framework ceremony.
+[`testutil/fakes.go`](overseer/internal/testutil/fakes.go) holds one fake per external dependency, and they all work the same way: **set public fields to script what the fake should return, and read public slices/counters to see what was asked of it.** No mocking framework — tests read as plain arrange → act → assert.
 
-| Fake | Stands in for | Script fields → recorded calls |
+| Fake | Stands in for | Script these fields → read these back |
 |---|---|---|
-| `FakeGraph` | Graph mail + subscriptions | `Messages`, `MessagesByID`, `ConversationsByID` → `GetCalls`, `ConversationsFetched`, `TokensSeen` |
+| `FakeGraph` | Microsoft Graph mail + subscriptions | `Messages`, `MessagesByID`, `ConversationsByID` → `GetCalls`, `ConversationsFetched`, `TokensSeen` |
 | `FakeLLM` | Claude | `FilterResult`, `Extractions`, `Findings`, `RankResult`, `PlanResult` → `ExtractCalls`, `PlanFieldsSeen`, … |
 | `FakeDrive` / `FakeExcel` | OneDrive / Excel | `SearchResults`, `RecentItems`, `Structures` → `QueriesSeen`, `Appends` |
-| `InMemOrders` / `InMemDiscrepancies` / `InMemOttoScans` / `InMemSubscriptions` | Postgres repos | seed via `Upsert`/`Insert`/`AddUser` → `Count()`, `All()` |
-| `EventRecorder` | The `/ws` hub | — → `Events`, `OfType(t)` |
-| `FakeTokens` / `StaticResolver` | Token cache / auth | `Put(userID, token)` / fixed `User` |
+| `InMemOrders` / `InMemDiscrepancies` / `InMemOttoScans` / `InMemSubscriptions` | The Postgres tables | seed via `Upsert`/`Insert`/`AddUser` → `Count()`, `All()` |
+| `EventRecorder` | The websocket hub | — → `Events`, `OfType(t)` |
+| `FakeTokens` / `StaticResolver` | Token cache / login | `Put(userID, token)` / a fixed `User` |
 
-### Anatomy of an E2E test
+### What an E2E test looks like
 
-`newEnv(t)` in [`orders_e2e_test.go`](overseer/internal/controller/http/orders_e2e_test.go) builds a fully wired `httptest.Server` — real `NewRouter`, real usecases, fakes at the edges — and hands back the `env` struct so your test can reach every fake. Two details make it deterministic: `Dispatch` runs jobs synchronously (no goroutine races), and `StaticResolver` mimics single-user auth.
+`newEnv(t)` in [`orders_e2e_test.go`](overseer/internal/controller/http/orders_e2e_test.go) builds a fully wired test server — real router, real usecases, fakes at the edges — and returns an `env` struct that gives your test a handle on every fake. Two details keep it deterministic: background jobs run synchronously in tests (no goroutine races), and `StaticResolver` stands in for single-user login.
 
-Adding a test to an existing feature is three steps: **seed the fakes, hit the endpoint, assert the body *and* the side effects**:
+Writing a new test is three steps — seed the fakes, hit the endpoint, then assert **both** the HTTP response **and** the side effects:
 
 ```go
 func TestPostSync_SeedsOrderAndPublishesEvent(t *testing.T) {
 	e := newEnv(t)
-	// 1. Arrange: script what Graph and the LLM "would" return
+	// 1. Arrange: script what Graph and Claude "would" return
 	e.graph.Messages = []entity.EmailMessage{
 		{ID: "m1", ConversationID: "conv-a", Subject: "PO #4471 confirmed"},
 	}
@@ -312,10 +344,10 @@ func TestPostSync_SeedsOrderAndPublishesEvent(t *testing.T) {
 		"conv-a": {CompanyName: "Delmar Tooling", OrderID: 4471, Status: entity.OrderStatusConfirmed},
 	}
 
-	// 2. Act: real HTTP through the real router + middleware
+	// 2. Act: a real HTTP request through the real router + middleware
 	resp, _ := e.request(t, http.MethodPost, "/sync", true)
 
-	// 3. Assert: response AND side effects
+	// 3. Assert: the response AND the side effects
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", resp.StatusCode)
 	}
@@ -328,98 +360,100 @@ func TestPostSync_SeedsOrderAndPublishesEvent(t *testing.T) {
 }
 ```
 
-### Per-feature seeding recipes
+### Recipes: what to seed and assert, per feature
 
-- **Order List sync** — script `graph.Messages`, `llm.FilterResult`, `llm.Extractions` → `POST /sync` → assert `repo.Count()` and a `sync.completed` event.
-- **Webhook / live updates** — script `graph.MessagesByID`, register the user + subscription on `InMemSubscriptions`, cache a token with `FakeTokens.Put` (the webhook has no bearer of its own) → `POST /webhooks/graph` with a notification payload (`{"value":[{"subscriptionId":…,"clientState":…,"resourceData":{"id":…}}]}`) → assert the merge-upsert and the `order.updated` event. Always include the negative case: a wrong `clientState` must be dropped, not processed ([`webhooks_e2e_test.go`](overseer/internal/controller/http/webhooks_e2e_test.go) does exactly this).
-- **Thread Audit** — seed an existing order, script `graph.ConversationsByID` (the full thread) and `llm.Findings` keyed by the *new* message id → fire the webhook → assert `discs.Count()` and the `discrepancy.found` event.
-- **Otto scan** — script the thread + `llm.Extractions`, `drive.SearchResults`, `llm.RankResult` → `POST /otto/scans` → assert the response's `extractedFields`/`destinations` and that exactly one scan row exists. On failure paths, assert **no scan row leaked**.
-- **Otto record** — seed a scan directly on `InMemOttoScans`, script `excel.Structures`, `llm.PlanResult`, `drive.Items` → `POST /otto/scans/{id}/record` → assert `excel.Appends` got exactly the planned row and `llm.PlanFieldsSeen` saw the *user-edited* fields, not the stored ones. Then the contract cases: unknown scan → 404, second record → 409.
+- **First sync** — script `graph.Messages`, `llm.FilterResult`, `llm.Extractions` → `POST /sync` → assert `repo.Count()` and one `sync.completed` event.
+- **Live updates (webhook)** — script `graph.MessagesByID`; register the user + subscription on `InMemSubscriptions`; cache a token with `FakeTokens.Put` (the webhook carries no bearer token of its own) → `POST /webhooks/graph` with a notification body (`{"value":[{"subscriptionId":…,"clientState":…,"resourceData":{"id":…}}]}`) → assert the order was updated and an `order.updated` event fired. Always test the negative case too: a wrong `clientState` must be dropped, not processed ([`webhooks_e2e_test.go`](overseer/internal/controller/http/webhooks_e2e_test.go) does exactly this).
+- **Thread Audit** — seed an existing order; script `graph.ConversationsByID` (the full thread) and `llm.Findings` keyed by the *new* message's id → fire the webhook → assert `discs.Count()` and a `discrepancy.found` event.
+- **Otto scan** — script the thread, `llm.Extractions`, `drive.SearchResults`, `llm.RankResult` → `POST /otto/scans` → assert the response's `extractedFields` and `destinations`, and that exactly one scan row exists. On failure paths, assert **no scan row leaked**.
+- **Otto record** — seed a scan on `InMemOttoScans`; script `excel.Structures`, `llm.PlanResult`, `drive.Items` → `POST /otto/scans/{id}/record` → assert `excel.Appends` received exactly the planned row, and that `llm.PlanFieldsSeen` saw the *user-edited* fields rather than the stored ones. Then the contract cases: unknown scan → `404`, recording twice → `409`.
 
 ### Checklist for a brand-new feature
 
-1. **Entity first** — add domain types + validators in `internal/entity` with table-driven tests (see [`discrepancy_test.go`](overseer/internal/entity/discrepancy_test.go)).
-2. **Usecase test-driven** — declare the ports the usecase needs in its own `ports.go`, fake them locally in the `_test.go`, and TDD the orchestration (partial failures, idempotent re-delivery, "LLM finishes before any write").
-3. **New gateway method?** Extend the real gateway with an `httptest`-server test asserting the exact request (path, query, body, auth header) — and mirror the method onto the matching `testutil` fake.
-4. **E2E** — add fields to the `env` struct, wire the controller in `newEnv`, then write the happy path + every documented error status.
-5. **Wire it in the composition root** — assign the real gateway/repo into the usecase's interface-typed fields in [`cmd/overseer/main.go`](overseer/cmd/overseer/main.go); that assignment is itself the compile-time conformance check, so signature drift between a port and its adapter fails the build.
-6. `make test && make vet` — still no DB, still no network.
+1. **Entity first** — add the domain types + validators in `internal/entity` with table-driven tests (example: [`discrepancy_test.go`](overseer/internal/entity/discrepancy_test.go)).
+2. **Usecase, test-driven** — declare the interfaces the usecase needs in its own `ports.go`, fake them locally in the `_test.go`, and test the orchestration: partial failures, safe re-delivery, "all AI work finishes before any write."
+3. **New gateway method?** Add an `httptest`-server test asserting the exact outgoing request (path, query, body, auth header) — and mirror the new method onto the matching `testutil` fake.
+4. **E2E** — add the new fake to the `env` struct, wire the controller in `newEnv`, then cover the happy path plus every documented error status.
+5. **Wire it at startup** — plug the real gateway/repo into the usecase's interface-typed fields in [`main.go`](overseer/cmd/overseer/main.go). That assignment is itself the compile-time check: if a port and its implementation drift apart, the build fails.
+6. `make test && make vet` — still no database, still no network.
 
 ### The live LLM eval (the one test that costs money)
 
-[`filter_live_test.go`](overseer/internal/gateway/llm/filter_live_test.go) runs the **real model** against a fixture inbox built from production traffic — including the account-security junk mail that fooled the filter three times in the wild. It self-skips without a key:
+[`filter_live_test.go`](overseer/internal/gateway/llm/filter_live_test.go) runs the **real model** against a fixture inbox built from production traffic — including the account-security junk mail that fooled the filter three times in the wild. It skips itself when no key is set:
 
 ```sh
 cd overseer
 ANTHROPIC_API_KEY=sk-ant-... go test ./internal/gateway/llm -run TestFilterOrderMessagesLive -v
 ```
 
-Run it whenever you touch a prompt in `gateway/llm` — prompt regressions don't show up in faked tests.
+Run it whenever you change a prompt in `gateway/llm` — prompt regressions never show up in the faked tests.
 
 ---
 
 ## Guide: trying it live with emails to yourself
 
-You can exercise every feature end-to-end against your own mailbox — no supplier required. You play both roles: the operator (via the API) and the supplier (via emails you send yourself).
+You can exercise every feature end-to-end against your own mailbox — no real supplier needed. You play both roles: the operator (through the API) and the supplier (through emails you send yourself).
 
-**You'll need:** a Microsoft account with Outlook + OneDrive, an Anthropic API key, `curl` + `jq`, and a websocket client (`npm i -g wscat`). A second email account (any Gmail works) makes the supplier side more realistic, but replying to yourself works too.
+**You'll need:** a Microsoft account with Outlook + OneDrive, an Anthropic API key, `curl` + `jq`, and a websocket client (`npm i -g wscat`). A second email account (any Gmail) makes the supplier side more realistic, but replying to yourself works too.
 
-### 1. Grab a Graph token
+### 1. Get a Microsoft Graph token
 
-Open [Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer), sign in with the Microsoft account, and copy the token from the **Access token** tab.
+Open [Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer), sign in, and copy the token from the **Access token** tab.
 
-- For the order list / audit features, consent to **`Mail.Read`**.
-- For Otto, you also need **`Files.ReadWrite`** — a mail-only token gets `403` on every OneDrive/Excel call (this has bitten before).
-- Tokens expire after ~1 hour. When calls start returning `401 InvalidAuthenticationToken`, grab a fresh one.
+- For the order list and audit features, consent to the **`Mail.Read`** permission.
+- For Otto, you also need **`Files.ReadWrite`** — a mail-only token gets `403` on every OneDrive/Excel call. (This has bitten before.)
+- Tokens expire after about an hour. When calls start returning `401 InvalidAuthenticationToken`, grab a fresh one.
 
 ```sh
 export TOKEN="<paste from Graph Explorer>"
 ```
 
-### 2. Stage a supplier thread in your inbox
+### 2. Stage a fake supplier thread in your inbox
 
-Send yourself an email *as the supplier*, then keep **replying on the same thread** — replies share a `conversationId`, which is how Overseer groups a thread. A good script:
+Send yourself an email *as the supplier*, then keep **replying on the same thread** — replies share a conversation id, which is how Overseer knows messages belong together. A script that exercises everything:
 
-> **Message 1 — the confirmation** (this becomes the order row)
+> **Message 1 — the confirmation** (becomes the order row)
 > Subject: `PO #4471 — Order Confirmation`
 > Body: *"Hi, confirming your order PO #4471: 500 units of 3/8" carbide inserts at $4.20/unit. Estimated delivery August 15, 2026. — Dana, Delmar Tooling"*
 >
-> **Message 2 — the slip** (reply; this is audit bait: a `date` discrepancy)
+> **Message 2 — the date slip** (a reply; bait for a `date` discrepancy)
 > *"Quick update — the carbide inserts are now estimated for August 29 due to a mill delay."*
 >
-> **Message 3 — the price bump** (reply; a `price` discrepancy)
+> **Message 3 — the price bump** (a reply; bait for a `price` discrepancy)
 > *"Also flagging: material surcharge brings the unit price to $4.85."*
 
-### 3. Boot the stack
+### 3. Start the server
 
 ```sh
 cd overseer
 cp .env.example .env      # fill in ANTHROPIC_API_KEY
 make db-up
-make run                  # migrations auto-apply, serves :8080
+make run                  # serves on :8080
 ```
 
-### 4. Open the realtime channel
+### 4. Watch the realtime channel
 
-In a second terminal — every pipeline announces its results here:
+In a second terminal. Every pipeline announces its results here, so keep this open:
 
 ```sh
 wscat -c ws://localhost:8080/ws -H "Authorization: Bearer $TOKEN"
 ```
 
-### 5. Run the onboarding sync (Feature: Order List)
+### 5. Run the first sync (Order List)
 
 ```sh
 curl -s -X POST localhost:8080/sync -H "Authorization: Bearer $TOKEN"
-# → 202 {"syncId": "..."}  ... then "sync.completed" appears on the websocket
+# → 202 {"syncId": "..."} ... then "sync.completed" appears on the websocket
 curl -s "localhost:8080/orders" -H "Authorization: Bearer $TOKEN" | jq
 ```
 
-You should see your Delmar Tooling thread as an order — and your real inbox noise filtered out. If the filter misjudges something, set `LOG_LEVEL="debug"` in `.env` and rerun to see the raw LLM responses. **Side effect you want:** this authed call also fills the in-memory token cache, which the webhook pipeline needs (step 6).
+Your Delmar Tooling thread should appear as an order, with your real inbox noise filtered out. If the filter misjudges something, set `LOG_LEVEL="debug"` in `.env` and rerun to see Claude's raw responses.
 
-### 6. Live updates (Feature: Post-Sync) — two ways
+One side effect you want: this authenticated call also fills the in-memory token cache, which the webhook pipeline (next step) depends on.
 
-**Option A — real webhooks (needs a public URL).** Graph must reach your machine to validate the subscription, so tunnel first:
+### 6. Live updates — two ways to trigger them
+
+**Option A — real webhooks (needs a public URL).** Microsoft must be able to reach your machine to verify the subscription, so open a tunnel first:
 
 ```sh
 ngrok http 8080          # or: cloudflared tunnel --url http://localhost:8080
@@ -427,9 +461,9 @@ ngrok http 8080          # or: cloudflared tunnel --url http://localhost:8080
 curl -s -X POST localhost:8080/subscriptions -H "Authorization: Bearer $TOKEN"
 ```
 
-Now every new mail fires the pipeline for real: send yourself Message 2 and watch `order.updated` arrive on the websocket.
+From now on every new email fires the pipeline for real: send Message 2 and watch `order.updated` arrive on the websocket.
 
-**Option B — simulated notification (no tunnel).** Skip Graph's delivery and POST the notification yourself; everything downstream (real Graph fetch, real LLM, real DB write) still runs. First seed a subscription row so the webhook can resolve a user:
+**Option B — simulated notification (no tunnel needed).** Skip Microsoft's delivery and POST the notification yourself. Everything downstream still runs for real — the Graph fetch, the Claude call, the database write. First, seed a subscription row so the webhook can figure out whose mailbox it is:
 
 ```sh
 docker compose exec postgres psql -U postgres overseer -c \
@@ -437,7 +471,7 @@ docker compose exec postgres psql -U postgres overseer -c \
    SELECT id, 'sub-local-1', now() + interval '2 days' FROM users LIMIT 1;"
 ```
 
-Get the real id of the new message (send Message 2, then in Graph Explorer run `GET /me/messages?$top=3&$select=id,subject,conversationId`), and fire:
+Send Message 2, look up its real id in Graph Explorer (`GET /me/messages?$top=3&$select=id,subject,conversationId`), and fire the notification:
 
 ```sh
 curl -s -X POST localhost:8080/webhooks/graph -H "Content-Type: application/json" -d '{
@@ -450,11 +484,14 @@ curl -s -X POST localhost:8080/webhooks/graph -H "Content-Type: application/json
 }'
 ```
 
-`clientState` must match `GRAPH_CLIENT_STATE` (default above) or the notification is dropped as spoofed — try a wrong value once to see it. Remember the token cache is in-memory: **after any server restart, make one authed call (e.g. re-run `/sync`) before firing notifications**, or the job has no Graph token and skips.
+Two things to know:
 
-### 7. Trip the auditor (Feature: Thread Audit)
+- `clientState` must match `GRAPH_CLIENT_STATE` (default shown above), or the notification is dropped as spoofed. Try a wrong value once to see it happen.
+- The token cache is in-memory. **After any server restart, make one authenticated call (e.g. re-run `/sync`) before firing notifications** — otherwise the background job has no Microsoft token and skips the message.
 
-Send Message 3 (the price bump), fire its notification (or let the real webhook deliver it), and watch `discrepancy.found` on the websocket:
+### 7. Trip the auditor (Thread Audit)
+
+Send Message 3 (the price bump) and fire its notification (or let the real webhook deliver it). `discrepancy.found` appears on the websocket:
 
 ```sh
 curl -s "localhost:8080/discrepancies?status=open" -H "Authorization: Bearer $TOKEN" | jq
@@ -463,19 +500,20 @@ curl -s -X PATCH localhost:8080/discrepancies/<id> \
   -d '{"status":"resolved"}'
 ```
 
-The finding carries the metric (`price`), priority, the supporting quotes from both messages, and a deep link back to the email.
+The finding carries the category (`price`), a priority, the supporting quotes from both messages, and a deep link back to the email.
 
-### 8. Record it with Otto (Feature: Otto) — needs the `Files.ReadWrite` token
+### 8. Record it with Otto (needs the `Files.ReadWrite` token)
 
-In OneDrive, create `Orders.xlsx` and give it a **real Excel table** (select your header row — e.g. `PO | Supplier | Price | ETA` — then *Insert → Table*): the Excel API appends to tables, not loose cells. Naming it something like `Delmar orders.xlsx` helps, since Otto searches OneDrive by supplier name and PO number.
+In OneDrive, create `Orders.xlsx` and give it a **real Excel table**: type a header row (e.g. `PO | Supplier | Price | ETA`), select it, then *Insert → Table*. This matters because the Excel API appends to tables, not to loose cells. Naming the file something like `Delmar orders.xlsx` helps, since Otto searches OneDrive by supplier name and PO number.
 
 ```sh
-# Scan: extract + suggest destinations (messageId/conversationId from Graph Explorer)
+# Step 1 — Scan: extract fields + suggest spreadsheets
+# (messageId/conversationId come from Graph Explorer)
 curl -s -X POST localhost:8080/otto/scans \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"messageId":"<real-message-id>","conversationId":"<real-conversation-id>"}' | jq
 
-# Record: YOU approve — edit any field, pick a destination id from the scan response
+# Step 2 — Record: YOU approve — edit any field, pick a destination id from the scan response
 curl -s -X POST localhost:8080/otto/scans/<scanId>/record \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"selectedResource":"<drive-item-id>","fields":{"companyName":"Delmar Tooling Inc.","orderId":4471,"status":"confirmed"}}' | jq
@@ -483,7 +521,7 @@ curl -s -X POST localhost:8080/otto/scans/<scanId>/record \
 
 Open the returned `webUrl` — your row is in the sheet, with exactly the values you approved. Recording the same scan twice returns `409`.
 
-### 9. Verify in Postgres
+### 9. Check the database
 
 ```sh
 docker compose exec postgres psql -U postgres overseer
@@ -501,6 +539,6 @@ SELECT status, selected_resource FROM otto_scans;
 |---|---|
 | `401 InvalidAuthenticationToken` from Graph | Token expired (~1 h) — grab a fresh one from Graph Explorer |
 | `403` on `/otto/scans` | Token lacks `Files.ReadWrite` — re-consent in Graph Explorer |
-| Webhook returns `202` but nothing happens | Check server logs: `clientState mismatch` (wrong secret), `skipped_unknown_subscription` (no `graph_subscriptions` row), or empty token cache (make an authed call after every restart) |
-| `/sync` finds none of your emails | The LLM filter judged them non-orders — make the supplier email more explicit (PO number, quantities, price) and check `LOG_LEVEL=debug` output |
-| `POST /subscriptions` fails | Graph couldn't validate the webhook — `PUBLIC_BASE_URL` must be reachable from the internet (tunnel running, value matches) |
+| Webhook returns `202` but nothing happens | Check the server logs: `clientState mismatch` (wrong secret), `skipped_unknown_subscription` (no `graph_subscriptions` row), or an empty token cache (make one authed call after every restart) |
+| `/sync` finds none of your emails | The filter judged them non-orders — make the supplier email more explicit (PO number, quantities, price) and check the `LOG_LEVEL=debug` output |
+| `POST /subscriptions` fails | Microsoft couldn't validate the webhook — `PUBLIC_BASE_URL` must be reachable from the internet (tunnel running, value matches) |
