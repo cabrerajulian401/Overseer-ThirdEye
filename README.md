@@ -32,6 +32,8 @@ Two flows: **user-driven** — Loki calls the API, a usecase reads mail and file
 
 ## Video demo (backend)
 
+**Live Order List Update**: An incoming email is recieved describing that September 22nd is the new arrival date for the PO. Overseer recieves this email via MSFT Webhook, sends it to the LLM & receives the updated payload patching the orders DB Table all in realtime. 
+
 <video src="https://github.com/user-attachments/assets/3164e5a3-67b0-4141-891d-084dac13eec2" controls width="600"></video>
 
 **One key design decision: Overseer never stores your email.** It only stores what it *derives* from email — orders, alerts, scan results. Whenever it needs the original messages again, it re-fetches them from Microsoft. Your mailbox stays the single source of truth.
