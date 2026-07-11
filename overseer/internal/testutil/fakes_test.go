@@ -69,6 +69,43 @@ func TestInMemDiscrepancies(t *testing.T) {
 	}
 }
 
+func TestInMemOttoScans(t *testing.T) {
+	repo := NewInMemOttoScans()
+	userID := uuid.New()
+
+	stored, err := repo.Insert(context.Background(), entity.OttoScan{
+		AccountID: uuid.New(), UserID: userID,
+		MessageID: "msg-1", ConversationID: "conv-1",
+		Fields: entity.OrderExtraction{CompanyName: "Delmar Tooling", OrderID: 4471},
+		Status: entity.ScanScanned,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ID == uuid.Nil {
+		t.Fatal("Insert did not mint an id")
+	}
+
+	got, found, err := repo.GetByID(context.Background(), userID, stored.ID)
+	if err != nil || !found || got.Fields.CompanyName != "Delmar Tooling" {
+		t.Fatalf("GetByID = %+v, %v, %v", got, found, err)
+	}
+	if _, found, _ := repo.GetByID(context.Background(), uuid.New(), stored.ID); found {
+		t.Fatal("another user's read matched the row")
+	}
+
+	if err := repo.MarkRecorded(context.Background(), userID, stored.ID, "item-1"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ = repo.GetByID(context.Background(), userID, stored.ID)
+	if got.Status != entity.ScanRecorded || got.SelectedResource != "item-1" {
+		t.Errorf("after MarkRecorded: %+v", got)
+	}
+	if err := repo.MarkRecorded(context.Background(), userID, uuid.New(), "item-1"); err == nil {
+		t.Fatal("MarkRecorded on unknown id should error")
+	}
+}
+
 func TestInMemSubscriptions(t *testing.T) {
 	subs := NewInMemSubscriptions()
 	user := entity.User{ID: uuid.New(), AccountID: uuid.New(), Email: "op@x.com"}

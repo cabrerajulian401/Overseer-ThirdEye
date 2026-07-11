@@ -111,12 +111,24 @@ type FakeLLM struct {
 	// Findings maps the new message's id → what FindDiscrepancies returns.
 	Findings map[string][]entity.DiscrepancyFinding
 	FindErr  error
+	// RankResult is what RankDestinations returns; RankCandidatesSeen records
+	// the candidate ids of each call.
+	RankResult []entity.DriveItem
+	RankErr    error
+	// PlanResult is what PlanSheetAppend returns; PlanFieldsSeen records the
+	// (user-approved) fields of each call.
+	PlanResult entity.SheetAppendPlan
+	PlanErr    error
 
-	FilterCalls   int
-	ExtractCalls  int
-	ThreadsSeen   []string
-	FindCalls     int
-	HistoriesSeen [][]string // message ids of each history passed in
+	FilterCalls        int
+	ExtractCalls       int
+	ThreadsSeen        []string
+	FindCalls          int
+	HistoriesSeen      [][]string // message ids of each history passed in
+	RankCalls          int
+	RankCandidatesSeen [][]string
+	PlanCalls          int
+	PlanFieldsSeen     []entity.OrderExtraction
 }
 
 func (f *FakeLLM) FilterOrderMessages(_ context.Context, _ []entity.EmailMessage) ([]string, error) {
@@ -147,6 +159,180 @@ func (f *FakeLLM) FindDiscrepancies(_ context.Context, newMsg entity.EmailMessag
 		return nil, f.FindErr
 	}
 	return f.Findings[newMsg.ID], nil
+}
+
+func (f *FakeLLM) RankDestinations(_ context.Context, _ entity.OrderExtraction, candidates []entity.DriveItem) ([]entity.DriveItem, error) {
+	f.RankCalls++
+	ids := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		ids = append(ids, c.ID)
+	}
+	f.RankCandidatesSeen = append(f.RankCandidatesSeen, ids)
+	if f.RankErr != nil {
+		return nil, f.RankErr
+	}
+	return f.RankResult, nil
+}
+
+func (f *FakeLLM) PlanSheetAppend(_ context.Context, _ entity.WorkbookStructure, fields entity.OrderExtraction) (entity.SheetAppendPlan, error) {
+	f.PlanCalls++
+	f.PlanFieldsSeen = append(f.PlanFieldsSeen, fields)
+	if f.PlanErr != nil {
+		return entity.SheetAppendPlan{}, f.PlanErr
+	}
+	return f.PlanResult, nil
+}
+
+// --- FakeDrive -----------------------------------------------------------------
+
+type FakeDrive struct {
+	// SearchResults maps query → items returned for it.
+	SearchResults map[string][]entity.DriveItem
+	SearchErr     error
+	RecentItems   []entity.DriveItem
+	RecentErr     error
+	// Items maps item id → item for GetItem.
+	Items      map[string]entity.DriveItem
+	GetItemErr error
+
+	QueriesSeen  []string
+	RecentCalls  int
+	ItemsFetched []string
+	TokensSeen   []string
+}
+
+func (f *FakeDrive) Search(_ context.Context, accessToken, query string) ([]entity.DriveItem, error) {
+	f.TokensSeen = append(f.TokensSeen, accessToken)
+	f.QueriesSeen = append(f.QueriesSeen, query)
+	if f.SearchErr != nil {
+		return nil, f.SearchErr
+	}
+	return f.SearchResults[query], nil
+}
+
+func (f *FakeDrive) Recent(_ context.Context, accessToken string) ([]entity.DriveItem, error) {
+	f.TokensSeen = append(f.TokensSeen, accessToken)
+	f.RecentCalls++
+	if f.RecentErr != nil {
+		return nil, f.RecentErr
+	}
+	return f.RecentItems, nil
+}
+
+func (f *FakeDrive) GetItem(_ context.Context, accessToken, itemID string) (entity.DriveItem, error) {
+	f.TokensSeen = append(f.TokensSeen, accessToken)
+	f.ItemsFetched = append(f.ItemsFetched, itemID)
+	if f.GetItemErr != nil {
+		return entity.DriveItem{}, f.GetItemErr
+	}
+	item, ok := f.Items[itemID]
+	if !ok {
+		return entity.DriveItem{}, fmt.Errorf("fake drive: no item %q", itemID)
+	}
+	return item, nil
+}
+
+// --- FakeExcel -----------------------------------------------------------------
+
+// ExcelAppend records one AppendTableRow invocation.
+type ExcelAppend struct {
+	ItemID string
+	Table  string
+	Values []string
+}
+
+type FakeExcel struct {
+	// Structures maps drive item id → workbook structure.
+	Structures   map[string]entity.WorkbookStructure
+	StructureErr error
+	AppendErr    error
+
+	StructuresFetched []string
+	Appends           []ExcelAppend
+}
+
+func (f *FakeExcel) GetWorkbookStructure(_ context.Context, _ string, itemID string) (entity.WorkbookStructure, error) {
+	f.StructuresFetched = append(f.StructuresFetched, itemID)
+	if f.StructureErr != nil {
+		return entity.WorkbookStructure{}, f.StructureErr
+	}
+	structure, ok := f.Structures[itemID]
+	if !ok {
+		return entity.WorkbookStructure{}, fmt.Errorf("fake excel: no workbook %q", itemID)
+	}
+	return structure, nil
+}
+
+func (f *FakeExcel) AppendTableRow(_ context.Context, _ string, itemID, tableName string, values []string) error {
+	if f.AppendErr != nil {
+		return f.AppendErr
+	}
+	f.Appends = append(f.Appends, ExcelAppend{ItemID: itemID, Table: tableName, Values: values})
+	return nil
+}
+
+// --- InMemOttoScans --------------------------------------------------------------
+
+// InMemOttoScans is an in-memory ScanRepo.
+type InMemOttoScans struct {
+	mu      sync.Mutex
+	rows    map[uuid.UUID]entity.OttoScan
+	Inserts int
+}
+
+func NewInMemOttoScans() *InMemOttoScans {
+	return &InMemOttoScans{rows: make(map[uuid.UUID]entity.OttoScan)}
+}
+
+func (r *InMemOttoScans) Insert(_ context.Context, s entity.OttoScan) (entity.OttoScan, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Inserts++
+	s.ID = uuid.New()
+	s.CreatedAt = time.Now()
+	s.UpdatedAt = s.CreatedAt
+	r.rows[s.ID] = s
+	return s, nil
+}
+
+func (r *InMemOttoScans) GetByID(_ context.Context, userID, id uuid.UUID) (entity.OttoScan, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.rows[id]
+	if !ok || s.UserID != userID {
+		return entity.OttoScan{}, false, nil
+	}
+	return s, true, nil
+}
+
+func (r *InMemOttoScans) MarkRecorded(_ context.Context, userID, id uuid.UUID, selectedResource string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.rows[id]
+	if !ok || s.UserID != userID {
+		return fmt.Errorf("fake otto scans: no scan %s for user", id)
+	}
+	s.Status = entity.ScanRecorded
+	s.SelectedResource = selectedResource
+	s.UpdatedAt = time.Now()
+	r.rows[id] = s
+	return nil
+}
+
+func (r *InMemOttoScans) Count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.rows)
+}
+
+func (r *InMemOttoScans) All() []entity.OttoScan {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]entity.OttoScan, 0, len(r.rows))
+	for _, s := range r.rows {
+		out = append(out, s)
+	}
+	return out
 }
 
 // --- InMemOrders -------------------------------------------------------------

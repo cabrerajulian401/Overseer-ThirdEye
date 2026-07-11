@@ -13,12 +13,15 @@ import (
 	httpctl "github.com/thirdeye/overseer/internal/controller/http"
 	"github.com/thirdeye/overseer/internal/controller/ws"
 	"github.com/thirdeye/overseer/internal/entity"
+	"github.com/thirdeye/overseer/internal/gateway/drive"
+	"github.com/thirdeye/overseer/internal/gateway/excel"
 	"github.com/thirdeye/overseer/internal/gateway/graph"
 	"github.com/thirdeye/overseer/internal/gateway/llm"
 	"github.com/thirdeye/overseer/internal/repo"
 	"github.com/thirdeye/overseer/internal/tokencache"
 	"github.com/thirdeye/overseer/internal/usecase/messages"
 	"github.com/thirdeye/overseer/internal/usecase/orders"
+	"github.com/thirdeye/overseer/internal/usecase/otto"
 	"github.com/thirdeye/overseer/internal/usecase/subscriptions"
 )
 
@@ -44,6 +47,14 @@ var (
 	_ subscriptions.GraphSubscriber  = (*graph.Client)(nil)
 	_ subscriptions.SubscriptionRepo = (*repo.Subscriptions)(nil)
 	_ subscriptions.TokenSource      = (*tokencache.Cache)(nil)
+
+	_ otto.ThreadFetcher = (*graph.Client)(nil)
+	_ otto.DriveSearcher = (*drive.Client)(nil)
+	_ otto.ItemGetter    = (*drive.Client)(nil)
+	_ otto.OttoLLM       = (*llm.Gateway)(nil)
+	_ otto.PlanLLM       = (*llm.Gateway)(nil)
+	_ otto.Workbook      = (*excel.Client)(nil)
+	_ otto.ScanRepo      = (*repo.OttoScans)(nil)
 
 	_ httpctl.TokenSink = (*tokencache.Cache)(nil)
 )
@@ -138,10 +149,13 @@ func main() {
 
 	// Adapters.
 	graphClient := graph.New()
+	driveClient := drive.New()
+	excelClient := excel.New()
 	llmGateway := llm.New(cfg.LLMModel, log)
 	orderRepo := repo.NewOrders(pool)
 	subsRepo := repo.NewSubscriptions(pool)
 	discRepo := repo.NewDiscrepancies(pool)
+	ottoRepo := repo.NewOttoScans(pool)
 	tokens := tokencache.New()
 	hub := ws.NewHub(log)
 
@@ -205,6 +219,11 @@ func main() {
 			List:   &orders.ListDiscrepancies{Repo: discRepo},
 			Update: &orders.UpdateDiscrepancyStatus{Repo: discRepo},
 			Log:    log,
+		},
+		Otto: &httpctl.OttoController{
+			Resolve: &otto.ResolveDestinations{Graph: graphClient, Drive: driveClient, LLM: llmGateway, Repo: ottoRepo},
+			Record:  &otto.RecordOrder{Repo: ottoRepo, Excel: excelClient, LLM: llmGateway, Drive: driveClient},
+			Log:     log,
 		},
 		Webhooks: &httpctl.WebhooksController{
 			Handle:      handleChange,

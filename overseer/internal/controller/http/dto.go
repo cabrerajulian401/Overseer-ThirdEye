@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/base64"
+	"fmt"
 	"time"
 
 	"github.com/thirdeye/overseer/internal/entity"
@@ -95,6 +96,93 @@ func toDiscrepancyDTO(d entity.Discrepancy) discrepancyDTO {
 		Quotes:      quotes,
 		DateCreated: d.CreatedAt.UTC().Format(time.RFC3339),
 	}
+}
+
+// extractedFieldsDTO is the confirm card's shape, used in both directions:
+// the scan response carries the raw extraction; the record request carries
+// the user-edited version.
+type extractedFieldsDTO struct {
+	CompanyName     string  `json:"companyName"`
+	EmailAddress    string  `json:"emailAddress,omitempty"`
+	OrderID         int     `json:"orderId"`
+	Status          string  `json:"status,omitempty"`
+	OriginalEstDate *string `json:"originalEstDate"`
+	CurrentEstDate  *string `json:"currentEstDate"`
+	LastMessenger   string  `json:"lastMessenger,omitempty"`
+	SupportingQuote string  `json:"supportingQuote,omitempty"`
+}
+
+type destinationDTO struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	WebURL string `json:"webUrl"`
+}
+
+type scanRequest struct {
+	MessageID      string `json:"messageId"`
+	ConversationID string `json:"conversationId"`
+}
+
+type scanResponse struct {
+	ScanID          string             `json:"scanId"`
+	ExtractedFields extractedFieldsDTO `json:"extractedFields"`
+	Destinations    []destinationDTO   `json:"destinations"`
+}
+
+type recordRequest struct {
+	SelectedResource string             `json:"selectedResource"`
+	Fields           extractedFieldsDTO `json:"fields"`
+}
+
+type recordResponse struct {
+	WebURL string `json:"webUrl"`
+	Status string `json:"status"`
+}
+
+func toExtractedFieldsDTO(f entity.OrderExtraction) extractedFieldsDTO {
+	return extractedFieldsDTO{
+		CompanyName:     f.CompanyName,
+		EmailAddress:    f.EmailAddress,
+		OrderID:         f.OrderID,
+		Status:          string(f.Status),
+		OriginalEstDate: dateString(f.OriginalEstDate),
+		CurrentEstDate:  dateString(f.CurrentEstDate),
+		LastMessenger:   f.LastMessenger,
+		SupportingQuote: f.SupportingQuote,
+	}
+}
+
+// fromExtractedFieldsDTO parses the user-approved fields; bad dates are a
+// 400, not a silent nil.
+func fromExtractedFieldsDTO(d extractedFieldsDTO) (entity.OrderExtraction, error) {
+	parse := func(s *string) (*time.Time, error) {
+		if s == nil || *s == "" {
+			return nil, nil
+		}
+		t, err := time.Parse("2006-01-02", *s)
+		if err != nil {
+			return nil, err
+		}
+		return &t, nil
+	}
+	original, err := parse(d.OriginalEstDate)
+	if err != nil {
+		return entity.OrderExtraction{}, fmt.Errorf("originalEstDate: %w", err)
+	}
+	current, err := parse(d.CurrentEstDate)
+	if err != nil {
+		return entity.OrderExtraction{}, fmt.Errorf("currentEstDate: %w", err)
+	}
+	return entity.OrderExtraction{
+		CompanyName:     d.CompanyName,
+		EmailAddress:    d.EmailAddress,
+		OrderID:         d.OrderID,
+		Status:          entity.OrderStatus(d.Status),
+		OriginalEstDate: original,
+		CurrentEstDate:  current,
+		LastMessenger:   d.LastMessenger,
+		SupportingQuote: d.SupportingQuote,
+	}, nil
 }
 
 // graphNotification mirrors one entry of Graph's change-notification POST.

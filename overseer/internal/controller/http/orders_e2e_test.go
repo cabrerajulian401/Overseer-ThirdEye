@@ -15,6 +15,7 @@ import (
 	"github.com/thirdeye/overseer/internal/entity"
 	"github.com/thirdeye/overseer/internal/testutil"
 	"github.com/thirdeye/overseer/internal/usecase/orders"
+	"github.com/thirdeye/overseer/internal/usecase/otto"
 )
 
 // env is a fully wired test server: real router, middleware, controllers,
@@ -27,6 +28,9 @@ type env struct {
 	llm    *testutil.FakeLLM
 	repo   *testutil.InMemOrders
 	discs  *testutil.InMemDiscrepancies
+	drive  *testutil.FakeDrive
+	excel  *testutil.FakeExcel
+	otto   *testutil.InMemOttoScans
 	events *testutil.EventRecorder
 }
 
@@ -38,6 +42,9 @@ func newEnv(t *testing.T) *env {
 	llm := &testutil.FakeLLM{}
 	repo := testutil.NewInMemOrders()
 	discs := testutil.NewInMemDiscrepancies()
+	driveFake := &testutil.FakeDrive{SearchResults: map[string][]entity.DriveItem{}, Items: map[string]entity.DriveItem{}}
+	excelFake := &testutil.FakeExcel{Structures: map[string]entity.WorkbookStructure{}}
+	ottoScans := testutil.NewInMemOttoScans()
 	events := &testutil.EventRecorder{}
 	log := slog.New(slog.DiscardHandler)
 
@@ -58,12 +65,18 @@ func newEnv(t *testing.T) *env {
 			Update: &orders.UpdateDiscrepancyStatus{Repo: discs},
 			Log:    log,
 		},
+		Otto: &OttoController{
+			Resolve: &otto.ResolveDestinations{Graph: graph, Drive: driveFake, LLM: llm, Repo: ottoScans},
+			Record:  &otto.RecordOrder{Repo: ottoScans, Excel: excelFake, LLM: llm, Drive: driveFake},
+			Log:     log,
+		},
 		WS: noopWS{},
 	})
 
 	srv := httptest.NewServer(e)
 	t.Cleanup(srv.Close)
-	return &env{srv: srv, user: user, graph: graph, llm: llm, repo: repo, discs: discs, events: events}
+	return &env{srv: srv, user: user, graph: graph, llm: llm, repo: repo, discs: discs,
+		drive: driveFake, excel: excelFake, otto: ottoScans, events: events}
 }
 
 type noopWS struct{}
