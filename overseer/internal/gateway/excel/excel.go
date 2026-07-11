@@ -34,54 +34,75 @@ type workbookColumn struct {
 }
 
 type workbookTable struct {
-	Name    string           `json:"name"`
-	Columns []workbookColumn `json:"columns"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type tablesResponse struct {
 	Value []workbookTable `json:"value"`
 }
 
+type columnsResponse struct {
+	Value []workbookColumn `json:"value"`
+}
+
 // GetWorkbookStructure reads the workbook's tables and their column headers
 // — the only context PlanSheetAppend needs; data rows are never fetched.
+// Columns are fetched per table: the workbook API silently ignores
+// $expand=columns on the tables list (200, no columns field, no error).
 func (c *Client) GetWorkbookStructure(ctx context.Context, accessToken, itemID string) (entity.WorkbookStructure, error) {
-	q := url.Values{}
-	q.Set("$select", "name")
-	q.Set("$expand", "columns($select=name)")
-	reqURL := c.BaseURL + "/me/drive/items/" + url.PathEscape(itemID) + "/workbook/tables?" + q.Encode()
+	tablesURL := c.BaseURL + "/me/drive/items/" + url.PathEscape(itemID) + "/workbook/tables?" +
+		url.Values{"$select": {"id,name"}}.Encode()
+	var tables tablesResponse
+	if err := c.getJSON(ctx, accessToken, tablesURL, "list tables", &tables); err != nil {
+		return entity.WorkbookStructure{}, err
+	}
 
+	structure := entity.WorkbookStructure{Tables: make([]entity.WorkbookTable, 0, len(tables.Value))}
+	for _, tbl := range tables.Value {
+		colsURL := c.BaseURL + "/me/drive/items/" + url.PathEscape(itemID) +
+			"/workbook/tables/" + url.PathEscape(tbl.ID) + "/columns?" +
+			url.Values{"$select": {"name"}}.Encode()
+		var cols columnsResponse
+		if err := c.getJSON(ctx, accessToken, colsURL, "list columns", &cols); err != nil {
+			return entity.WorkbookStructure{}, err
+		}
+		// A real Excel table always has ≥1 column; empty means the API
+		// misbehaved — fail here rather than plan an empty row.
+		if len(cols.Value) == 0 {
+			return entity.WorkbookStructure{}, fmt.Errorf("excel: table %q returned no columns", tbl.Name)
+		}
+		names := make([]string, 0, len(cols.Value))
+		for _, col := range cols.Value {
+			names = append(names, col.Name)
+		}
+		structure.Tables = append(structure.Tables, entity.WorkbookTable{Name: tbl.Name, Columns: names})
+	}
+	return structure, nil
+}
+
+func (c *Client) getJSON(ctx context.Context, accessToken, reqURL, op string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return entity.WorkbookStructure{}, fmt.Errorf("excel: build request: %w", err)
+		return fmt.Errorf("excel: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return entity.WorkbookStructure{}, fmt.Errorf("excel: list tables: %w", err)
+		return fmt.Errorf("excel: %s: %w", op, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return entity.WorkbookStructure{}, fmt.Errorf("excel: list tables: status %d: %s", resp.StatusCode, body)
+		return fmt.Errorf("excel: %s: status %d: %s", op, resp.StatusCode, body)
 	}
-
-	var out tablesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return entity.WorkbookStructure{}, fmt.Errorf("excel: decode tables: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("excel: decode %s: %w", op, err)
 	}
-
-	structure := entity.WorkbookStructure{Tables: make([]entity.WorkbookTable, 0, len(out.Value))}
-	for _, tbl := range out.Value {
-		cols := make([]string, 0, len(tbl.Columns))
-		for _, col := range tbl.Columns {
-			cols = append(cols, col.Name)
-		}
-		structure.Tables = append(structure.Tables, entity.WorkbookTable{Name: tbl.Name, Columns: cols})
-	}
-	return structure, nil
+	return nil
 }
 
 // AppendTableRow appends one row to a workbook table

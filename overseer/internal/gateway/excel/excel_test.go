@@ -6,22 +6,34 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
+// The workbook API silently IGNORES $expand=columns — observed live: the
+// response echoes the projection in @odata.context but embeds no columns
+// field — so the client must list tables, then fetch each table's columns
+// with a separate GET /tables/{id}/columns call.
 func TestGetWorkbookStructure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if want := "/me/drive/items/item-1/workbook/tables"; r.URL.Path != want {
-			t.Errorf("path = %q, want %q", r.URL.Path, want)
-		}
 		if got := r.Header.Get("Authorization"); got != "Bearer tok-123" {
 			t.Errorf("auth header = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"value": [
-			{"name": "PO_Log", "columns": [{"name": "PO"}, {"name": "Supplier"}, {"name": "Price"}]},
-			{"name": "Contacts", "columns": [{"name": "Name"}, {"name": "Email"}]}
-		]}`)
+		switch r.URL.Path {
+		case "/me/drive/items/item-1/workbook/tables":
+			fmt.Fprint(w, `{"value": [
+				{"id": "{00000000-000C-0000-FFFF-FFFF00000000}", "name": "PO_Log"},
+				{"id": "{00000000-000C-0000-FFFF-FFFF00000001}", "name": "Contacts"}
+			]}`)
+		case "/me/drive/items/item-1/workbook/tables/{00000000-000C-0000-FFFF-FFFF00000000}/columns":
+			fmt.Fprint(w, `{"value": [{"id": "1", "name": "PO"}, {"id": "2", "name": "Supplier"}, {"id": "3", "name": "Price"}]}`)
+		case "/me/drive/items/item-1/workbook/tables/{00000000-000C-0000-FFFF-FFFF00000001}/columns":
+			fmt.Fprint(w, `{"value": [{"id": "1", "name": "Name"}, {"id": "2", "name": "Email"}]}`)
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
 	}))
 	defer srv.Close()
 
@@ -36,6 +48,32 @@ func TestGetWorkbookStructure(t *testing.T) {
 	first := structure.Tables[0]
 	if first.Name != "PO_Log" || len(first.Columns) != 3 || first.Columns[1] != "Supplier" {
 		t.Errorf("table = %+v", first)
+	}
+	second := structure.Tables[1]
+	if second.Name != "Contacts" || len(second.Columns) != 2 || second.Columns[1] != "Email" {
+		t.Errorf("table = %+v", second)
+	}
+}
+
+// A real Excel table always has at least one column; an empty columns
+// response means the API misbehaved. Fail loudly — an empty structure
+// reaching the plan LLM produces an empty row that Graph then rejects.
+func TestGetWorkbookStructureNoColumns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/me/drive/items/item-1/workbook/tables":
+			fmt.Fprint(w, `{"value": [{"id": "{00000000-000C-0000-FFFF-FFFF00000000}", "name": "PO_Log"}]}`)
+		default:
+			fmt.Fprint(w, `{"value": []}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+	_, err := c.GetWorkbookStructure(context.Background(), "tok", "item-1")
+	if err == nil || !strings.Contains(err.Error(), "PO_Log") {
+		t.Fatalf("err = %v, want error naming the empty table", err)
 	}
 }
 
