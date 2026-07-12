@@ -252,3 +252,68 @@ func decodeCursor(s string) (*time.Time, error) {
 	}
 	return &t, nil
 }
+
+type checkupDTO struct {
+	ID             string  `json:"id"`
+	FlowID         string  `json:"flowId"`
+	ConversationID string  `json:"conversationId,omitempty"`
+	CompanyName    string  `json:"companyName"`
+	EmailAddress   string  `json:"emailAddress"`
+	OrderID        int     `json:"orderId"`
+	Status         string  `json:"status"`
+	Subject        string  `json:"subject"`
+	Body           string  `json:"body"`
+	SendDate       string  `json:"sendDate"` // RFC3339
+	CurrentEstDate *string `json:"currentEstDate"`
+	CancelIfReply  bool    `json:"cancelIfReply"`
+	RepeatFlow     int     `json:"repeatFlow"`
+	DateCreated    string  `json:"dateCreated"`
+}
+
+// createCheckupRequest: ids and owner are NEVER read from the body — the
+// server mints ids, auth supplies the owner.
+type createCheckupRequest struct {
+	ConversationID  string  `json:"conversationId"`
+	CompanyName     string  `json:"companyName"`
+	EmailAddress    string  `json:"emailAddress"`
+	OrderID         int     `json:"orderId"`
+	Subject         string  `json:"subject"`
+	Body            string  `json:"body"`
+	SendDate        string  `json:"sendDate"`        // RFC3339 — when the first message goes out
+	CurrentEstDate  *string `json:"currentEstDate"`  // YYYY-MM-DD
+	CancelIfReply   bool    `json:"cancelIfReply"`
+	RepeatFlow      int     `json:"repeatFlow"`      // total messages in the flow; <1 means 1
+	RepeatEveryDays int     `json:"repeatEveryDays"` // gap between sends; required when repeatFlow > 1
+}
+
+type createCheckupResponse struct {
+	FlowID   string       `json:"flowId"`
+	Checkups []checkupDTO `json:"checkups"`
+}
+
+type listCheckupsResponse struct {
+	Checkups []checkupDTO `json:"checkups"`
+}
+
+type patchCheckupRequest struct {
+	Status string `json:"status"`
+}
+
+func toCheckupDTO(m entity.CheckupMessage) checkupDTO {
+	return checkupDTO{
+		ID:             m.ID.String(),
+		FlowID:         m.FlowID.String(),
+		ConversationID: m.ConversationID,
+		CompanyName:    m.CompanyName,
+		EmailAddress:   m.EmailAddress,
+		OrderID:        m.OrderID,
+		Status:         string(m.Status),
+		Subject:        m.Subject,
+		Body:           m.Body,
+		SendDate:       m.SendDate.UTC().Format(time.RFC3339),
+		CurrentEstDate: dateString(m.CurrentEstDate),
+		CancelIfReply:  m.CancelIfReply,
+		RepeatFlow:     m.RepeatFlow,
+		DateCreated:    m.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
