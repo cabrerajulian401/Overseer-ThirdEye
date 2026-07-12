@@ -272,3 +272,63 @@ func toEntity(gm graphMessage) entity.EmailMessage {
 		CreatedDateTime:   created,
 	}
 }
+
+// sendMailRequest mirrors Graph's POST /me/sendMail body.
+type sendMailRequest struct {
+	Message         sendMailMessage `json:"message"`
+	SaveToSentItems bool            `json:"saveToSentItems"`
+}
+
+type sendMailMessage struct {
+	Subject      string         `json:"subject"`
+	Body         sendMailBody   `json:"body"`
+	ToRecipients []sendMailAddr `json:"toRecipients"`
+}
+
+type sendMailBody struct {
+	ContentType string `json:"contentType"`
+	Content     string `json:"content"`
+}
+
+type sendMailAddr struct {
+	EmailAddress struct {
+		Address string `json:"address"`
+	} `json:"emailAddress"`
+}
+
+// SendMail creates and sends a message via Graph POST /me/sendMail (the
+// Checkups sender). Graph replies 202 Accepted with an empty body on success.
+func (c *Client) SendMail(ctx context.Context, accessToken, to, subject, body string) error {
+	var addr sendMailAddr
+	addr.EmailAddress.Address = to
+	payload, err := json.Marshal(sendMailRequest{
+		Message: sendMailMessage{
+			Subject:      subject,
+			Body:         sendMailBody{ContentType: "Text", Content: body},
+			ToRecipients: []sendMailAddr{addr},
+		},
+		SaveToSentItems: true,
+	})
+	if err != nil {
+		return fmt.Errorf("graph: marshal sendMail: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/me/sendMail", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("graph: build sendMail request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("graph: send mail: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("graph: send mail: status %d: %s", resp.StatusCode, respBody)
+	}
+	return nil
+}

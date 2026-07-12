@@ -156,3 +156,59 @@ func TestGetMessageNon200(t *testing.T) {
 		t.Fatal("want error on 404, got nil")
 	}
 }
+
+func TestSendMail(t *testing.T) {
+	var gotBody map[string]any
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/me/sendMail" {
+			t.Errorf("got %s %s, want POST /me/sendMail", r.Method, r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted) // Graph returns 202 with empty body
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+	err := c.SendMail(context.Background(), "tok-123", "dana@delmar.com", "Follow-up on PO 4471", "Hi Dana, any update?")
+	if err != nil {
+		t.Fatalf("SendMail: %v", err)
+	}
+	if gotAuth != "Bearer tok-123" {
+		t.Errorf("auth header = %q", gotAuth)
+	}
+	msg, _ := gotBody["message"].(map[string]any)
+	if msg["subject"] != "Follow-up on PO 4471" {
+		t.Errorf("subject = %v", msg["subject"])
+	}
+	body, _ := msg["body"].(map[string]any)
+	if body["contentType"] != "Text" || body["content"] != "Hi Dana, any update?" {
+		t.Errorf("body = %v", msg["body"])
+	}
+	recips, _ := msg["toRecipients"].([]any)
+	if len(recips) != 1 {
+		t.Fatalf("toRecipients = %v", msg["toRecipients"])
+	}
+	addr := recips[0].(map[string]any)["emailAddress"].(map[string]any)["address"]
+	if addr != "dana@delmar.com" {
+		t.Errorf("recipient = %v", addr)
+	}
+	if gotBody["saveToSentItems"] != true {
+		t.Errorf("saveToSentItems = %v", gotBody["saveToSentItems"])
+	}
+}
+
+func TestSendMailErrorStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+	if err := c.SendMail(context.Background(), "tok", "a@b.com", "s", "b"); err == nil {
+		t.Fatal("expected error on 503, got nil")
+	}
+}
