@@ -14,9 +14,9 @@ import (
 // channel → Audit (CatchDiscrepancies). Graph delivers at-least-once, so the
 // whole path is idempotent — the upsert is keyed on (user_id, conversation_id).
 //
-// Extension point (Checkups, not built yet): this is the only place that sees
-// supplier replies — when checkup_messages exists, cancel pending rows with
-// cancel_if_reply on this conversation here.
+// This is also the only place that sees supplier replies: any inbound message
+// on a conversation with pending cancel_if_reply checkups cancels them (the
+// Checkups field; nil disables).
 type HandleChangeMessage struct {
 	Subs   SubscriptionResolver
 	Tokens TokenSource
@@ -28,6 +28,10 @@ type HandleChangeMessage struct {
 	// Audit is the Discrepancy leg (spec: Audit rides this job and has no
 	// infrastructure of its own). nil disables it.
 	Audit DiscrepancyCatcher
+
+	// Checkups is the reply-cancel leg: pending cancel_if_reply rows on this
+	// conversation are cancelled when any inbound message arrives. nil disables.
+	Checkups CheckupCanceller
 }
 
 type HandleInput struct {
@@ -64,6 +68,17 @@ func (uc *HandleChangeMessage) Execute(ctx context.Context, in HandleInput) (Han
 	if err != nil {
 		return "", err
 	}
+
+	// Reply detection runs before the order-classification gate: a bare
+	// "thanks, will do" won't classify as an order update, but it IS supplier
+	// activity, so it must still cancel pending cancel_if_reply checkups.
+	// Cancelling is idempotent — Graph redelivery finds nothing left.
+	if uc.Checkups != nil {
+		if _, err := uc.Checkups.CancelPendingByConversation(ctx, user.ID, msg.ConversationID); err != nil {
+			return "", fmt.Errorf("cancel checkups on reply (conversation %s): %w", msg.ConversationID, err)
+		}
+	}
+
 	thread := entity.Thread{ConversationID: msg.ConversationID, Messages: []entity.EmailMessage{msg}}
 
 	existing, found, err := uc.Repo.GetByConversation(ctx, user.ID, msg.ConversationID)
