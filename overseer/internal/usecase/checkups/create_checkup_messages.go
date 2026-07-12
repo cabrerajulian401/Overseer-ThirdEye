@@ -46,7 +46,7 @@ func (uc *CreateCheckupMessages) Execute(ctx context.Context, in CreateInput) ([
 
 	flowID := uuid.New()
 	msgs := make([]entity.CheckupMessage, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		msgs = append(msgs, entity.CheckupMessage{
 			AccountID:      in.AccountID,
 			UserID:         in.UserID,
