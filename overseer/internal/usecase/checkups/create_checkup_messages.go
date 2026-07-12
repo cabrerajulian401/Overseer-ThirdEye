@@ -39,10 +39,7 @@ type CreateInput struct {
 // cadence, and stores the rows. Returns the stored rows with server-minted
 // ids in send-date order.
 func (uc *CreateCheckupMessages) Execute(ctx context.Context, in CreateInput) ([]entity.CheckupMessage, error) {
-	count := in.RepeatFlow
-	if count < 1 {
-		count = 1
-	}
+	count := max(in.RepeatFlow, 1)
 	if count > 1 && in.RepeatEvery <= 0 {
 		return nil, fmt.Errorf("repeat interval must be positive for a %d-message flow", count)
 	}
