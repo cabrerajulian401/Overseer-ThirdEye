@@ -137,3 +137,70 @@ func TestInMemSubscriptions(t *testing.T) {
 		t.Fatalf("after renewal ListExpiring = %v, want empty", due)
 	}
 }
+
+func TestInMemCheckups(t *testing.T) {
+	repo := NewInMemCheckups()
+	userID := uuid.New()
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+
+	stored, err := repo.InsertFlow(context.Background(), []entity.CheckupMessage{
+		{UserID: userID, FlowID: uuid.New(), ConversationID: "conv-1", EmailAddress: "a@x.com",
+			Status: entity.CheckupPending, SendDate: now.Add(-time.Minute), CancelIfReply: true},
+		{UserID: userID, FlowID: uuid.New(), ConversationID: "conv-1", EmailAddress: "b@x.com",
+			Status: entity.CheckupPending, SendDate: now.Add(time.Hour)},
+	})
+	if err != nil || len(stored) != 2 {
+		t.Fatalf("InsertFlow = %v, %v", stored, err)
+	}
+	if stored[0].ID == uuid.Nil || stored[1].ID == uuid.Nil {
+		t.Fatal("InsertFlow did not mint ids")
+	}
+
+	// ClaimDue takes only the past-due pending row and flips it to sending.
+	due, err := repo.ClaimDue(context.Background(), now)
+	if err != nil || len(due) != 1 || due[0].EmailAddress != "a@x.com" {
+		t.Fatalf("ClaimDue = %v, %v", due, err)
+	}
+	if due[0].Status != entity.CheckupSending {
+		t.Errorf("claimed status = %q, want sending", due[0].Status)
+	}
+	// a second claim finds nothing (row is no longer pending)
+	if again, _ := repo.ClaimDue(context.Background(), now); len(again) != 0 {
+		t.Errorf("second ClaimDue = %v, want empty", again)
+	}
+
+	// Release puts it back; MarkSent finishes it.
+	if err := repo.Release(context.Background(), due[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	due, _ = repo.ClaimDue(context.Background(), now)
+	if len(due) != 1 {
+		t.Fatalf("reclaim after release = %v", due)
+	}
+	if err := repo.MarkSent(context.Background(), due[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	got, found, _ := repo.GetByID(context.Background(), userID, due[0].ID)
+	if !found || got.Status != entity.CheckupSent {
+		t.Errorf("after MarkSent: found=%v status=%q", found, got.Status)
+	}
+
+	// CancelPendingByConversation only hits pending cancel_if_reply rows.
+	n, err := repo.CancelPendingByConversation(context.Background(), userID, "conv-1")
+	if err != nil || n != 0 { // a@x.com is sent, b@x.com has CancelIfReply=false
+		t.Fatalf("cancel = %d, %v (want 0)", n, err)
+	}
+}
+
+func TestFakeGraphSendMail(t *testing.T) {
+	g := &FakeGraph{SendFailTo: "bad@x.com"}
+	if err := g.SendMail(context.Background(), "tok", "ok@x.com", "s", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SendMail(context.Background(), "tok", "bad@x.com", "s", "b"); err == nil {
+		t.Fatal("SendFailTo recipient should error")
+	}
+	if len(g.SentMails) != 1 || g.SentMails[0].To != "ok@x.com" || g.SentMails[0].Token != "tok" {
+		t.Errorf("SentMails = %+v", g.SentMails)
+	}
+}
