@@ -7,6 +7,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/thirdeye/overseer"
@@ -74,8 +75,9 @@ type config struct {
 	SeedUserEmail    string
 	SyncLookbackDays int
 
-	PublicBaseURL    string // where Graph reaches us; must be public https in real use
-	GraphClientState string // shared secret in every notification
+	PublicBaseURL    string   // where Graph reaches us; must be public https in real use
+	GraphClientState string   // shared secret in every notification
+	CORSOrigins      []string // frontend origins allowed by browsers; "*" for MVP
 	SubscriptionTTL  time.Duration
 	RenewAhead       time.Duration
 	RenewInterval    time.Duration
@@ -93,6 +95,7 @@ func loadConfig() config {
 
 		PublicBaseURL:    envOr("PUBLIC_BASE_URL", "http://localhost:8080"),
 		GraphClientState: envOr("GRAPH_CLIENT_STATE", "overseer-dev-client-state"),
+		CORSOrigins:      strings.Split(envOr("CORS_ORIGINS", "*"), ","),
 		SubscriptionTTL:  48 * time.Hour, // Graph caps message subscriptions ~3 days
 		RenewAhead:       12 * time.Hour,
 		RenewInterval:    time.Hour,
@@ -229,10 +232,11 @@ func main() {
 	}
 
 	e := httpctl.NewRouter(httpctl.RouterDeps{
-		Resolver:      staticResolver{user: seedUser},
-		Tokens:        tokens,
-		Orders:        ordersController,
-		Subscriptions: &httpctl.SubscriptionsController{Ensure: ensureSub, Log: log},
+		Resolver:       staticResolver{user: seedUser},
+		Tokens:         tokens,
+		AllowedOrigins: cfg.CORSOrigins,
+		Orders:         ordersController,
+		Subscriptions:  &httpctl.SubscriptionsController{Ensure: ensureSub, Log: log},
 		Discrepancies: &httpctl.DiscrepanciesController{
 			List:   &orders.ListDiscrepancies{Repo: discRepo},
 			Update: &orders.UpdateDiscrepancyStatus{Repo: discRepo},
