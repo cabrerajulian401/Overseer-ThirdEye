@@ -45,7 +45,12 @@ func NewRouter(d RouterDeps) *echo.Echo {
 		e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 			LogStatus: true, LogURI: true, LogMethod: true,
 			LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
-				d.Log.Info("request", "method", v.Method, "uri", v.URI, "status", v.Status)
+				uri := v.URI
+				// /ws carries the auth token in its query string; never log it.
+				if path := c.Request().URL.Path; path == "/ws" {
+					uri = path
+				}
+				d.Log.Info("request", "method", v.Method, "uri", uri, "status", v.Status)
 				return nil
 			},
 		}))
@@ -55,7 +60,10 @@ func NewRouter(d RouterDeps) *echo.Echo {
 
 	e.GET("/orders", d.Orders.GetOrders, auth)
 	e.POST("/sync", d.Orders.PostSync, auth)
-	e.GET("/ws", func(c echo.Context) error { return d.WS.Handler(c) }, auth)
+	// Browser WebSocket clients can't set headers, so /ws alone also accepts
+	// ?token=, promoted into the Authorization header before the same auth
+	// middleware every other route uses.
+	e.GET("/ws", func(c echo.Context) error { return d.WS.Handler(c) }, wsQueryTokenFallback, auth)
 	if d.Subscriptions != nil {
 		e.POST("/subscriptions", d.Subscriptions.PostSubscriptions, auth)
 	}
@@ -78,4 +86,18 @@ func NewRouter(d RouterDeps) *echo.Echo {
 	}
 
 	return e
+}
+
+// wsQueryTokenFallback promotes ?token= into the Authorization header when no
+// header is present. Echo has already URL-decoded the query param. An existing
+// header — valid or not — always wins; the query param is then ignored.
+func wsQueryTokenFallback(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		if c.Request().Header.Get("Authorization") == "" {
+			if token := c.QueryParam("token"); token != "" {
+				c.Request().Header.Set("Authorization", "Bearer "+token)
+			}
+		}
+		return next(c)
+	}
 }
