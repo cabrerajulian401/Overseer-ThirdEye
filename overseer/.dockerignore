@@ -1,0 +1,7 @@
+.env
+.env.*
+.git
+docker-compose.yml
+Building-Journal/
+docs/
+**/*_test.go

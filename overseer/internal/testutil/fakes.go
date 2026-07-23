@@ -42,6 +42,20 @@ type FakeGraph struct {
 	ConversationsByID    map[string][]entity.EmailMessage
 	ListConvErr          error
 	ConversationsFetched []string
+
+	// SendMail support. SendErr fails every send; SendFailTo fails only that
+	// recipient (batch tests). SentMails records successful sends.
+	SendErr    error
+	SendFailTo string
+	SentMails  []SentMail
+}
+
+// SentMail records one successful SendMail invocation.
+type SentMail struct {
+	Token   string
+	To      string
+	Subject string
+	Body    string
 }
 
 // SubscriptionCall records one CreateSubscription invocation.
@@ -87,6 +101,18 @@ func (f *FakeGraph) RenewSubscription(_ context.Context, _ string, subscriptionI
 		return f.RenewErr
 	}
 	f.RenewedIDs = append(f.RenewedIDs, subscriptionID)
+	return nil
+}
+
+func (f *FakeGraph) SendMail(_ context.Context, accessToken, to, subject, body string) error {
+	f.TokensSeen = append(f.TokensSeen, accessToken)
+	if f.SendErr != nil {
+		return f.SendErr
+	}
+	if f.SendFailTo != "" && to == f.SendFailTo {
+		return fmt.Errorf("fake graph: send to %q failed", to)
+	}
+	f.SentMails = append(f.SentMails, SentMail{Token: accessToken, To: to, Subject: subject, Body: body})
 	return nil
 }
 
@@ -484,6 +510,158 @@ func (r *InMemDiscrepancies) All() []entity.Discrepancy {
 	out := make([]entity.Discrepancy, 0, len(r.rows))
 	for _, d := range r.rows {
 		out = append(out, d)
+	}
+	return out
+}
+
+// --- InMemCheckups -------------------------------------------------------------
+
+// InMemCheckups is an in-memory CheckupRepo; it also satisfies the webhook
+// job's CheckupCanceller port.
+type InMemCheckups struct {
+	mu      sync.Mutex
+	rows    map[uuid.UUID]entity.CheckupMessage
+	Inserts int
+}
+
+func NewInMemCheckups() *InMemCheckups {
+	return &InMemCheckups{rows: make(map[uuid.UUID]entity.CheckupMessage)}
+}
+
+// Seed inserts one row exactly as given (minting only the id) so tests can
+// create sent/sending/paused rows directly.
+func (r *InMemCheckups) Seed(m entity.CheckupMessage) entity.CheckupMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m.ID = uuid.New()
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = time.Now()
+	}
+	m.UpdatedAt = m.CreatedAt
+	r.rows[m.ID] = m
+	return m
+}
+
+func (r *InMemCheckups) InsertFlow(_ context.Context, msgs []entity.CheckupMessage) ([]entity.CheckupMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]entity.CheckupMessage, 0, len(msgs))
+	for _, m := range msgs {
+		r.Inserts++
+		m.ID = uuid.New()
+		m.CreatedAt = time.Now()
+		m.UpdatedAt = m.CreatedAt
+		r.rows[m.ID] = m
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+func (r *InMemCheckups) ClaimDue(_ context.Context, now time.Time) ([]entity.CheckupMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []entity.CheckupMessage
+	for id, m := range r.rows {
+		if m.Status == entity.CheckupPending && !m.SendDate.After(now) {
+			m.Status = entity.CheckupSending
+			m.UpdatedAt = time.Now()
+			r.rows[id] = m
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SendDate.Before(out[j].SendDate) })
+	return out, nil
+}
+
+func (r *InMemCheckups) MarkSent(_ context.Context, id uuid.UUID) error {
+	return r.finishClaim(id, entity.CheckupSent)
+}
+
+func (r *InMemCheckups) Release(_ context.Context, id uuid.UUID) error {
+	return r.finishClaim(id, entity.CheckupPending)
+}
+
+func (r *InMemCheckups) finishClaim(id uuid.UUID, to entity.CheckupStatus) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.rows[id]
+	if !ok || m.Status != entity.CheckupSending {
+		return fmt.Errorf("fake checkups: no claimed row %s", id)
+	}
+	m.Status = to
+	m.UpdatedAt = time.Now()
+	r.rows[id] = m
+	return nil
+}
+
+func (r *InMemCheckups) GetByID(_ context.Context, userID, id uuid.UUID) (entity.CheckupMessage, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.rows[id]
+	if !ok || m.UserID != userID {
+		return entity.CheckupMessage{}, false, nil
+	}
+	return m, true, nil
+}
+
+func (r *InMemCheckups) UpdateStatus(_ context.Context, userID, id uuid.UUID, s entity.CheckupStatus) (entity.CheckupMessage, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.rows[id]
+	if !ok || m.UserID != userID {
+		return entity.CheckupMessage{}, false, nil
+	}
+	m.Status = s
+	m.UpdatedAt = time.Now()
+	r.rows[id] = m
+	return m, true, nil
+}
+
+func (r *InMemCheckups) ListByUser(_ context.Context, userID uuid.UUID, status *entity.CheckupStatus) ([]entity.CheckupMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []entity.CheckupMessage
+	for _, m := range r.rows {
+		if m.UserID != userID {
+			continue
+		}
+		if status != nil && m.Status != *status {
+			continue
+		}
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SendDate.Before(out[j].SendDate) })
+	return out, nil
+}
+
+func (r *InMemCheckups) CancelPendingByConversation(_ context.Context, userID uuid.UUID, conversationID string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for id, m := range r.rows {
+		if m.UserID == userID && m.ConversationID == conversationID &&
+			m.Status == entity.CheckupPending && m.CancelIfReply {
+			m.Status = entity.CheckupCancelled
+			m.UpdatedAt = time.Now()
+			r.rows[id] = m
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (r *InMemCheckups) Count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.rows)
+}
+
+func (r *InMemCheckups) All() []entity.CheckupMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]entity.CheckupMessage, 0, len(r.rows))
+	for _, m := range r.rows {
+		out = append(out, m)
 	}
 	return out
 }

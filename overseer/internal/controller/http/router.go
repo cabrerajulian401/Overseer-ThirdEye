@@ -15,15 +15,17 @@ type WSHandler interface {
 }
 
 type RouterDeps struct {
-	Resolver      UserResolver
-	Tokens        TokenSink // optional: caches Graph tokens for background jobs
-	Orders        *OrdersController
-	Subscriptions *SubscriptionsController
-	Discrepancies *DiscrepanciesController
-	Otto          *OttoController
-	Webhooks      *WebhooksController
-	WS            WSHandler
-	Log           *slog.Logger
+	Resolver       UserResolver
+	Tokens         TokenSink // optional: caches Graph tokens for background jobs
+	AllowedOrigins []string  // CORS; empty means allow all (bearer auth, no cookies)
+	Orders         *OrdersController
+	Subscriptions  *SubscriptionsController
+	Discrepancies  *DiscrepanciesController
+	Otto           *OttoController
+	Checkups       *CheckupsController
+	Webhooks       *WebhooksController
+	WS             WSHandler
+	Log            *slog.Logger
 }
 
 // NewRouter assembles the Echo app. E2E tests build the same router with
@@ -32,6 +34,13 @@ func NewRouter(d RouterDeps) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(middleware.Recover())
+	// Browsers require CORS opt-in for cross-origin calls; safe with wildcard
+	// because auth is a bearer header, never cookies. Empty AllowOrigins
+	// falls back to Echo's default of "*".
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: d.AllowedOrigins,
+		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType},
+	}))
 	if d.Log != nil {
 		e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 			LogStatus: true, LogURI: true, LogMethod: true,
@@ -57,6 +66,11 @@ func NewRouter(d RouterDeps) *echo.Echo {
 	if d.Otto != nil {
 		e.POST("/otto/scans", d.Otto.PostScans, auth)
 		e.POST("/otto/scans/:scanId/record", d.Otto.PostRecord, auth)
+	}
+	if d.Checkups != nil {
+		e.POST("/checkups", d.Checkups.PostCheckups, auth)
+		e.GET("/checkups", d.Checkups.GetCheckups, auth)
+		e.PATCH("/checkups/:checkupId", d.Checkups.PatchCheckup, auth)
 	}
 	if d.Webhooks != nil {
 		// No auth middleware: Graph POSTs here directly; clientState is the check.

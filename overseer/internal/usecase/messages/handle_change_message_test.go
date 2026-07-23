@@ -323,3 +323,83 @@ func TestMissingTokenErrors(t *testing.T) {
 		t.Fatal("want error when no Graph token is cached")
 	}
 }
+
+func TestReplyCancelsPendingCheckups(t *testing.T) {
+	f := newFixture(t)
+	checkups := testutil.NewInMemCheckups()
+	f.uc.Checkups = checkups
+
+	// A known order conversation, so the message follows the known-thread path.
+	if err := f.repo.Upsert(context.Background(), entity.Order{
+		AccountID: f.user.AccountID, UserID: f.user.ID,
+		ConversationID: "conv-1", CompanyName: "Delmar Tooling", Status: entity.OrderStatusInTransit,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.graph.MessagesByID["msg-reply"] = entity.EmailMessage{
+		ID: "msg-reply", ConversationID: "conv-1", From: "dana@delmar.com",
+		Subject: "RE: Follow-up on PO 4471", CreatedDateTime: time.Now(),
+	}
+	f.llm.Extractions["conv-1"] = entity.OrderExtraction{CompanyName: "Delmar Tooling", OrderID: 4471}
+
+	seed := func(conv string, cancelIfReply bool, status entity.CheckupStatus) entity.CheckupMessage {
+		return checkups.Seed(entity.CheckupMessage{
+			UserID: f.user.ID, AccountID: f.user.AccountID, FlowID: uuid.New(),
+			ConversationID: conv, EmailAddress: "dana@delmar.com",
+			Status: status, CancelIfReply: cancelIfReply, SendDate: time.Now().Add(time.Hour),
+		})
+	}
+	toCancel1 := seed("conv-1", true, entity.CheckupPending)
+	toCancel2 := seed("conv-1", true, entity.CheckupPending)
+	keepNoFlag := seed("conv-1", false, entity.CheckupPending)
+	keepOtherConv := seed("conv-other", true, entity.CheckupPending)
+	keepSent := seed("conv-1", true, entity.CheckupSent)
+
+	if _, err := f.uc.Execute(context.Background(), HandleInput{SubscriptionID: "sub-1", MessageID: "msg-reply"}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	assertStatus := func(id uuid.UUID, want entity.CheckupStatus) {
+		t.Helper()
+		got, _, _ := checkups.GetByID(context.Background(), f.user.ID, id)
+		if got.Status != want {
+			t.Errorf("row %s = %q, want %q", id, got.Status, want)
+		}
+	}
+	assertStatus(toCancel1.ID, entity.CheckupCancelled)
+	assertStatus(toCancel2.ID, entity.CheckupCancelled)
+	assertStatus(keepNoFlag.ID, entity.CheckupPending)
+	assertStatus(keepOtherConv.ID, entity.CheckupPending)
+	assertStatus(keepSent.ID, entity.CheckupSent)
+}
+
+func TestReplyCancelRunsEvenForNonOrderMessages(t *testing.T) {
+	f := newFixture(t)
+	checkups := testutil.NewInMemCheckups()
+	f.uc.Checkups = checkups
+
+	// Unknown conversation the LLM does NOT classify as an order.
+	f.graph.MessagesByID["msg-thanks"] = entity.EmailMessage{
+		ID: "msg-thanks", ConversationID: "conv-new", From: "dana@delmar.com",
+		Subject: "Thanks!", CreatedDateTime: time.Now(),
+	}
+	f.llm.FilterResult = nil // filter keeps nothing
+
+	row := checkups.Seed(entity.CheckupMessage{
+		UserID: f.user.ID, AccountID: f.user.AccountID, FlowID: uuid.New(),
+		ConversationID: "conv-new", EmailAddress: "dana@delmar.com",
+		Status: entity.CheckupPending, CancelIfReply: true, SendDate: time.Now().Add(time.Hour),
+	})
+
+	outcome, err := f.uc.Execute(context.Background(), HandleInput{SubscriptionID: "sub-1", MessageID: "msg-thanks"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if outcome != OutcomeSkippedNotOrder {
+		t.Errorf("outcome = %q, want skipped_not_order", outcome)
+	}
+	got, _, _ := checkups.GetByID(context.Background(), f.user.ID, row.ID)
+	if got.Status != entity.CheckupCancelled {
+		t.Errorf("row = %q, want cancelled — the reply arrived even though it's not an order update", got.Status)
+	}
+}

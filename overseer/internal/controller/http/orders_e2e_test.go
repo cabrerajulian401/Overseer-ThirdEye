@@ -14,6 +14,7 @@ import (
 
 	"github.com/thirdeye/overseer/internal/entity"
 	"github.com/thirdeye/overseer/internal/testutil"
+	"github.com/thirdeye/overseer/internal/usecase/checkups"
 	"github.com/thirdeye/overseer/internal/usecase/orders"
 	"github.com/thirdeye/overseer/internal/usecase/otto"
 )
@@ -28,10 +29,11 @@ type env struct {
 	llm    *testutil.FakeLLM
 	repo   *testutil.InMemOrders
 	discs  *testutil.InMemDiscrepancies
-	drive  *testutil.FakeDrive
-	excel  *testutil.FakeExcel
-	otto   *testutil.InMemOttoScans
-	events *testutil.EventRecorder
+	drive    *testutil.FakeDrive
+	excel    *testutil.FakeExcel
+	otto     *testutil.InMemOttoScans
+	checkups *testutil.InMemCheckups
+	events   *testutil.EventRecorder
 }
 
 func newEnv(t *testing.T) *env {
@@ -45,6 +47,7 @@ func newEnv(t *testing.T) *env {
 	driveFake := &testutil.FakeDrive{SearchResults: map[string][]entity.DriveItem{}, Items: map[string]entity.DriveItem{}}
 	excelFake := &testutil.FakeExcel{Structures: map[string]entity.WorkbookStructure{}}
 	ottoScans := testutil.NewInMemOttoScans()
+	checkupRepo := testutil.NewInMemCheckups()
 	events := &testutil.EventRecorder{}
 	log := slog.New(slog.DiscardHandler)
 
@@ -70,13 +73,19 @@ func newEnv(t *testing.T) *env {
 			Record:  &otto.RecordOrder{Repo: ottoScans, Excel: excelFake, LLM: llm, Drive: driveFake},
 			Log:     log,
 		},
+		Checkups: &CheckupsController{
+			Create: &checkups.CreateCheckupMessages{Repo: checkupRepo},
+			List:   &checkups.ListCheckups{Repo: checkupRepo},
+			Update: &checkups.UpdateStatus{Repo: checkupRepo},
+			Log:    log,
+		},
 		WS: noopWS{},
 	})
 
 	srv := httptest.NewServer(e)
 	t.Cleanup(srv.Close)
 	return &env{srv: srv, user: user, graph: graph, llm: llm, repo: repo, discs: discs,
-		drive: driveFake, excel: excelFake, otto: ottoScans, events: events}
+		drive: driveFake, excel: excelFake, otto: ottoScans, checkups: checkupRepo, events: events}
 }
 
 type noopWS struct{}

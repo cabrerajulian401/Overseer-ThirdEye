@@ -49,3 +49,10 @@ type EventPublisher interface {
 type DiscrepancyCatcher interface {
 	Execute(ctx context.Context, accessToken string, order entity.Order, newMsg entity.EmailMessage) ([]entity.Discrepancy, error)
 }
+
+// CheckupCanceller is the Checkups hook — this job is the only place in the
+// system that sees supplier replies, so it is what wires cancel_if_reply to
+// reality. repo.Checkups satisfies it structurally.
+type CheckupCanceller interface {
+	CancelPendingByConversation(ctx context.Context, userID uuid.UUID, conversationID string) (int, error)
+}

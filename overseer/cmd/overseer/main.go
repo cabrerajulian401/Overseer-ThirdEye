@@ -7,6 +7,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/thirdeye/overseer"
@@ -19,6 +20,7 @@ import (
 	"github.com/thirdeye/overseer/internal/gateway/llm"
 	"github.com/thirdeye/overseer/internal/repo"
 	"github.com/thirdeye/overseer/internal/tokencache"
+	"github.com/thirdeye/overseer/internal/usecase/checkups"
 	"github.com/thirdeye/overseer/internal/usecase/messages"
 	"github.com/thirdeye/overseer/internal/usecase/orders"
 	"github.com/thirdeye/overseer/internal/usecase/otto"
@@ -48,6 +50,12 @@ var (
 	_ subscriptions.SubscriptionRepo = (*repo.Subscriptions)(nil)
 	_ subscriptions.TokenSource      = (*tokencache.Cache)(nil)
 
+	_ checkups.MailSender  = (*graph.Client)(nil)
+	_ checkups.TokenSource = (*tokencache.Cache)(nil)
+	_ checkups.CheckupRepo = (*repo.Checkups)(nil)
+
+	_ messages.CheckupCanceller = (*repo.Checkups)(nil)
+
 	_ otto.ThreadFetcher = (*graph.Client)(nil)
 	_ otto.DriveSearcher = (*drive.Client)(nil)
 	_ otto.ItemGetter    = (*drive.Client)(nil)
@@ -67,11 +75,13 @@ type config struct {
 	SeedUserEmail    string
 	SyncLookbackDays int
 
-	PublicBaseURL    string // where Graph reaches us; must be public https in real use
-	GraphClientState string // shared secret in every notification
+	PublicBaseURL    string   // where Graph reaches us; must be public https in real use
+	GraphClientState string   // shared secret in every notification
+	CORSOrigins      []string // frontend origins allowed by browsers; "*" for MVP
 	SubscriptionTTL  time.Duration
 	RenewAhead       time.Duration
 	RenewInterval    time.Duration
+	CheckupInterval  time.Duration
 }
 
 func loadConfig() config {
@@ -85,9 +95,11 @@ func loadConfig() config {
 
 		PublicBaseURL:    envOr("PUBLIC_BASE_URL", "http://localhost:8080"),
 		GraphClientState: envOr("GRAPH_CLIENT_STATE", "overseer-dev-client-state"),
+		CORSOrigins:      strings.Split(envOr("CORS_ORIGINS", "*"), ","),
 		SubscriptionTTL:  48 * time.Hour, // Graph caps message subscriptions ~3 days
 		RenewAhead:       12 * time.Hour,
 		RenewInterval:    time.Hour,
+		CheckupInterval:  time.Minute, // spec: scheduler ticks every 60s
 	}
 }
 
@@ -156,6 +168,7 @@ func main() {
 	subsRepo := repo.NewSubscriptions(pool)
 	discRepo := repo.NewDiscrepancies(pool)
 	ottoRepo := repo.NewOttoScans(pool)
+	checkupRepo := repo.NewCheckups(pool)
 	tokens := tokencache.New()
 	hub := ws.NewHub(log)
 
@@ -180,6 +193,7 @@ func main() {
 			Repo:   discRepo,
 			Events: hub,
 		},
+		Checkups: checkupRepo,
 	}
 	ensureSub := &subscriptions.EnsureSubscription{
 		Graph:           graphClient,
@@ -198,6 +212,13 @@ func main() {
 		Now:        time.Now,
 		Log:        log,
 	}
+	sendDueCheckups := &checkups.SendDueCheckups{
+		Repo:   checkupRepo,
+		Mail:   graphClient,
+		Tokens: tokens,
+		Now:    time.Now,
+		Log:    log,
+	}
 
 	// Controllers + router.
 	ordersController := &httpctl.OrdersController{
@@ -211,10 +232,11 @@ func main() {
 	}
 
 	e := httpctl.NewRouter(httpctl.RouterDeps{
-		Resolver:      staticResolver{user: seedUser},
-		Tokens:        tokens,
-		Orders:        ordersController,
-		Subscriptions: &httpctl.SubscriptionsController{Ensure: ensureSub, Log: log},
+		Resolver:       staticResolver{user: seedUser},
+		Tokens:         tokens,
+		AllowedOrigins: cfg.CORSOrigins,
+		Orders:         ordersController,
+		Subscriptions:  &httpctl.SubscriptionsController{Ensure: ensureSub, Log: log},
 		Discrepancies: &httpctl.DiscrepanciesController{
 			List:   &orders.ListDiscrepancies{Repo: discRepo},
 			Update: &orders.UpdateDiscrepancyStatus{Repo: discRepo},
@@ -224,6 +246,12 @@ func main() {
 			Resolve: &otto.ResolveDestinations{Graph: graphClient, Drive: driveClient, LLM: llmGateway, Repo: ottoRepo},
 			Record:  &otto.RecordOrder{Repo: ottoRepo, Excel: excelClient, LLM: llmGateway, Drive: driveClient},
 			Log:     log,
+		},
+		Checkups: &httpctl.CheckupsController{
+			Create: &checkups.CreateCheckupMessages{Repo: checkupRepo},
+			List:   &checkups.ListCheckups{Repo: checkupRepo},
+			Update: &checkups.UpdateStatus{Repo: checkupRepo},
+			Log:    log,
 		},
 		Webhooks: &httpctl.WebhooksController{
 			Handle:      handleChange,
@@ -245,6 +273,25 @@ func main() {
 				log.Error("subscription renewal pass failed", "error", err)
 			} else if n > 0 {
 				log.Info("subscriptions renewed", "count", n)
+			}
+		}
+	}()
+
+	// Checkup scheduler: every minute, send due follow-ups. One bad tick must
+	// not kill the loop; ctx cancellation stops it cleanly.
+	go func() {
+		ticker := time.NewTicker(cfg.CheckupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n, err := sendDueCheckups.Execute(ctx); err != nil {
+					log.Error("checkup send pass failed", "error", err)
+				} else if n > 0 {
+					log.Info("checkups sent", "count", n)
+				}
 			}
 		}
 	}()
