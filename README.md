@@ -149,11 +149,14 @@ All live updates reach the UI through **one** websocket: `GET /ws`. Every messag
 
 The rule for growth: new features add new event *types*, never a second socket. The channel is one-way — the client only listens, and anything it sends is ignored.
 
-### 6. Login (the current MVP shortcut)
+### 6. Login
 
-Every route except the webhook requires `Authorization: Bearer <token>`, where the token is the add-in's own Microsoft Graph token — Overseer passes it straight through to Microsoft when it needs to read mail or files.
+Every route except the webhook requires `Authorization: Bearer <token>`. What the token must be depends on `AUTH_MODE`:
 
-For now the system is **single-user**: any valid-looking token resolves to the one seeded user. The most recent token is also kept in memory, so background jobs (webhook processing, subscription renewals) can call Microsoft on the user's behalf. A durable multi-user login comes later.
+- **`mvp`** (default): any bearer is accepted, resolves to the one seeded user, and is passed straight through to Microsoft Graph. The most recent token is kept in memory for background jobs.
+- **`aad`**: the bearer must be an Office-SSO access token for our own app registration (scope `access_as_user`). Overseer validates it properly — signature against Microsoft's published keys, audience, issuer, expiry, scope — then exchanges it **on-behalf-of** the user for a Graph token, which is cached per user and refreshed automatically so background jobs keep working between sessions. Auth failures are `401` with an empty body; a revoked consent surfaces as `403 {"error":"interaction_required"}` so the frontend can prompt "reconnect your mailbox".
+
+The system is still **single-user** in both modes; multi-user later swaps the user-resolution step, not the middleware. Full details: `Scout/BE_Docs/Endpoints/Auth.md`.
 
 ---
 
@@ -268,6 +271,8 @@ make run                     # migrations auto-apply, server listens on :8080
 | `LLM_MODEL` | `claude-opus-4-8` | Override the model |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | The address Microsoft uses to reach `/webhooks/graph` |
 | `GRAPH_CLIENT_STATE` | `overseer-dev-client-state` | Shared secret checked on every webhook delivery |
+| `AUTH_MODE` | `mvp` | `aad` turns on real Azure AD validation + on-behalf-of Graph tokens |
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_CLIENT_SECRET` | — | The shared add-in/backend app registration; required when `AUTH_MODE=aad` |
 | `SEED_ACCOUNT_NAME` / `SEED_USER_EMAIL` | dev values | The single seeded account/user |
 | `LOG_LEVEL` | `info` | Set to `debug` to log raw Claude responses |
 
