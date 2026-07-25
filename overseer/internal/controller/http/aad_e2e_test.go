@@ -146,6 +146,20 @@ func (e *aadEnv) dialWS(t *testing.T, rawQuery string) (int, string, *websocket.
 	return res.StatusCode, string(body), conn
 }
 
+// waitForWSClients blocks until the hub has n registered connections. The 101
+// reaches the client before the hub registers the conn, so publishing right
+// after a dial races registration and loses the event (no replay).
+func waitForWSClients(t *testing.T, hub *ws.Hub, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for hub.Clients() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("hub never reached %d registered clients", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestAADWSQueryTokenUpgrades(t *testing.T) {
 	env := newAADEnv(t, aadGrantOK)
 
@@ -155,6 +169,7 @@ func TestAADWSQueryTokenUpgrades(t *testing.T) {
 	}
 
 	// Registered on the hub, not just upgraded.
+	waitForWSClients(t, env.hub, 1)
 	env.hub.Publish(entity.Event{Type: entity.EventSyncCompleted, Data: entity.SyncCompleted{}})
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, msg, err := conn.ReadMessage(); err != nil {

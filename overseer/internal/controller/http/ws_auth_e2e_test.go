@@ -122,6 +122,7 @@ func TestWSUpgradeWithQueryTokenOnly(t *testing.T) {
 	}
 
 	// The connection must be registered on the hub, not just upgraded.
+	waitForWSClients(t, e.hub, 1)
 	e.hub.Publish(entity.Event{Type: entity.EventSyncCompleted, Data: entity.SyncCompleted{}})
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, msg, err := conn.ReadMessage(); err != nil {
