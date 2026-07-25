@@ -16,7 +16,8 @@ type WSHandler interface {
 
 type RouterDeps struct {
 	Resolver       UserResolver
-	Tokens         TokenSink // optional: caches Graph tokens for background jobs
+	Tokens         TokenSink     // optional: caches Graph tokens for background jobs
+	Auth           Authenticator // optional: aad mode; when set, Resolver/Tokens are unused
 	AllowedOrigins []string  // CORS; empty means allow all (bearer auth, no cookies)
 	Orders         *OrdersController
 	Subscriptions  *SubscriptionsController
@@ -57,6 +58,9 @@ func NewRouter(d RouterDeps) *echo.Echo {
 	}
 
 	auth := AuthMiddleware(d.Resolver, d.Tokens)
+	if d.Auth != nil {
+		auth = AuthMiddlewareWith(d.Auth)
+	}
 
 	e.GET("/orders", d.Orders.GetOrders, auth)
 	e.POST("/sync", d.Orders.PostSync, auth)
