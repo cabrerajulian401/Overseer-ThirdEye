@@ -126,6 +126,15 @@ func (h *Hub) Handler(c echo.Context) error {
 	return nil
 }
 
+// Clients reports how many connections are currently registered. Registration
+// lands a beat AFTER the client sees the 101 — anyone publishing right after
+// a connect (tests especially) must await it, or the broadcast is lost.
+func (h *Hub) Clients() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.clients)
+}
+
 // Publish implements the usecases' EventPublisher port: broadcast the event
 // to every connected client. Safe to call with zero clients.
 func (h *Hub) Publish(e entity.Event) {

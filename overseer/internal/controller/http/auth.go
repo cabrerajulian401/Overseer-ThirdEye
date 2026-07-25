@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -24,6 +25,13 @@ type TokenSink interface {
 	Put(userID uuid.UUID, token string)
 }
 
+// Authenticator turns a bearer token into the authenticated user plus the
+// Graph token downstream code should use. mvp mode passes the bearer straight
+// through; aad mode validates it as our app's token and OBO-exchanges it.
+type Authenticator interface {
+	Authenticate(ctx context.Context, bearer string) (user entity.User, graphToken string, err error)
+}
+
 // AuthContext is what handlers read instead of the request body: userId and
 // accountId always come from auth, never from the client.
 type AuthContext struct {
@@ -35,32 +43,59 @@ type AuthContext struct {
 
 const authContextKey = "overseer.auth"
 
-// AuthMiddleware requires `Authorization: Bearer <graph token>` and stashes
-// the resolved AuthContext on the request. The token is the add-in's
-// Graph-scoped token; Overseer calls Graph with it on the user's behalf.
+// mvpAuthenticator is the current shortcut expressed as an Authenticator: any
+// resolvable bearer IS the Graph token, and the sink keeps it warm for
+// background jobs.
+type mvpAuthenticator struct {
+	resolver UserResolver
+	tokens   TokenSink
+}
+
+func (a mvpAuthenticator) Authenticate(ctx context.Context, bearer string) (entity.User, string, error) {
+	user, err := a.resolver.Resolve(ctx, bearer)
+	if err != nil {
+		return entity.User{}, "", err
+	}
+	if a.tokens != nil {
+		a.tokens.Put(user.ID, bearer)
+	}
+	return user, bearer, nil
+}
+
+// AuthMiddleware is the mvp-mode constructor, kept so existing wiring and
+// tests build unchanged.
 func AuthMiddleware(resolver UserResolver, tokens TokenSink) echo.MiddlewareFunc {
+	return AuthMiddlewareWith(mvpAuthenticator{resolver: resolver, tokens: tokens})
+}
+
+// AuthMiddlewareWith requires `Authorization: Bearer <token>` and stashes the
+// resolved AuthContext on the request. Failures are 401 with an empty body
+// (the documented contract — nothing about why leaks to callers), except the
+// one case the user must fix themselves: a Graph consent/interaction error,
+// surfaced as 403 {"error":"interaction_required"} for the FE to map to
+// "reconnect your mailbox".
+func AuthMiddlewareWith(a Authenticator) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			header := c.Request().Header.Get("Authorization")
 			token, ok := strings.CutPrefix(header, "Bearer ")
 			if !ok || strings.TrimSpace(token) == "" {
-				return c.JSON(http.StatusUnauthorized, errorResponse{Error: "missing bearer token"})
+				return c.NoContent(http.StatusUnauthorized)
 			}
 
-			user, err := resolver.Resolve(c.Request().Context(), token)
+			user, graphToken, err := a.Authenticate(c.Request().Context(), token)
 			if err != nil {
-				return c.JSON(http.StatusUnauthorized, errorResponse{Error: "invalid token"})
-			}
-
-			if tokens != nil {
-				tokens.Put(user.ID, token)
+				if errors.Is(err, entity.ErrReauthRequired) {
+					return c.JSON(http.StatusForbidden, errorResponse{Error: "interaction_required"})
+				}
+				return c.NoContent(http.StatusUnauthorized)
 			}
 
 			c.Set(authContextKey, AuthContext{
 				AccountID:  user.AccountID.String(),
 				UserID:     user.ID.String(),
 				User:       user,
-				GraphToken: token,
+				GraphToken: graphToken,
 			})
 			return next(c)
 		}
