@@ -10,10 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/thirdeye/overseer"
 	httpctl "github.com/thirdeye/overseer/internal/controller/http"
 	"github.com/thirdeye/overseer/internal/controller/ws"
 	"github.com/thirdeye/overseer/internal/entity"
+	"github.com/thirdeye/overseer/internal/gateway/aad"
 	"github.com/thirdeye/overseer/internal/gateway/drive"
 	"github.com/thirdeye/overseer/internal/gateway/excel"
 	"github.com/thirdeye/overseer/internal/gateway/graph"
@@ -65,6 +68,11 @@ var (
 	_ otto.ScanRepo      = (*repo.OttoScans)(nil)
 
 	_ httpctl.TokenSink = (*tokencache.Cache)(nil)
+
+	_ messages.TokenSource      = (*aad.Manager)(nil)
+	_ subscriptions.TokenSource = (*aad.Manager)(nil)
+	_ checkups.TokenSource      = (*aad.Manager)(nil)
+	_ httpctl.Authenticator     = (aad.Authenticator{})
 )
 
 type config struct {
@@ -74,6 +82,11 @@ type config struct {
 	SeedAccountName  string
 	SeedUserEmail    string
 	SyncLookbackDays int
+
+	AuthMode          string // "mvp" (accept any bearer) or "aad" (validate + OBO)
+	AzureClientID     string
+	AzureTenantID     string
+	AzureClientSecret string
 
 	PublicBaseURL    string   // where Graph reaches us; must be public https in real use
 	GraphClientState string   // shared secret in every notification
@@ -92,6 +105,11 @@ func loadConfig() config {
 		SeedAccountName:  envOr("SEED_ACCOUNT_NAME", "ThirdEye Dev"),
 		SeedUserEmail:    envOr("SEED_USER_EMAIL", "operator@example.com"),
 		SyncLookbackDays: 30,
+
+		AuthMode:          envOr("AUTH_MODE", "mvp"),
+		AzureClientID:     os.Getenv("AZURE_CLIENT_ID"),
+		AzureTenantID:     os.Getenv("AZURE_TENANT_ID"),
+		AzureClientSecret: os.Getenv("AZURE_CLIENT_SECRET"),
 
 		PublicBaseURL:    envOr("PUBLIC_BASE_URL", "http://localhost:8080"),
 		GraphClientState: envOr("GRAPH_CLIENT_STATE", "overseer-dev-client-state"),
@@ -169,8 +187,44 @@ func main() {
 	discRepo := repo.NewDiscrepancies(pool)
 	ottoRepo := repo.NewOttoScans(pool)
 	checkupRepo := repo.NewCheckups(pool)
-	tokens := tokencache.New()
 	hub := ws.NewHub(log)
+
+	// Auth mode. mvp: any bearer is trusted and passed to Graph as-is. aad:
+	// the bearer must be our app registration's token; Graph tokens come from
+	// the OBO exchange and live in the aad manager instead of the mvp cache.
+	// Background jobs read whichever source the mode picked.
+	tokens := tokencache.New()
+	var (
+		routerAuth  httpctl.Authenticator
+		tokenSink   httpctl.TokenSink = tokens
+		graphTokens interface {
+			GraphToken(userID uuid.UUID) (string, bool)
+		} = tokens
+	)
+	switch cfg.AuthMode {
+	case "mvp":
+	case "aad":
+		if cfg.AzureClientID == "" || cfg.AzureTenantID == "" || cfg.AzureClientSecret == "" {
+			log.Error("AUTH_MODE=aad requires AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_CLIENT_SECRET")
+			os.Exit(1)
+		}
+		manager := aad.NewManager(&aad.OBOClient{
+			TenantID:     cfg.AzureTenantID,
+			ClientID:     cfg.AzureClientID,
+			ClientSecret: cfg.AzureClientSecret,
+		}, log)
+		routerAuth = aad.Authenticator{
+			Validator: &aad.Validator{ClientID: cfg.AzureClientID, TenantID: cfg.AzureTenantID},
+			Tokens:    manager,
+			User:      seedUser,
+		}
+		graphTokens = manager
+		tokenSink = nil
+		log.Info("auth mode: aad", "clientId", cfg.AzureClientID, "tenantId", cfg.AzureTenantID)
+	default:
+		log.Error("unknown AUTH_MODE", "mode", cfg.AuthMode)
+		os.Exit(1)
+	}
 
 	// Usecases.
 	listOrders := &orders.ListOrders{Repo: orderRepo}
@@ -182,7 +236,7 @@ func main() {
 	}
 	handleChange := &messages.HandleChangeMessage{
 		Subs:   subsRepo,
-		Tokens: tokens,
+		Tokens: graphTokens,
 		Latest: &messages.GetLatestMessage{Graph: graphClient},
 		LLM:    llmGateway,
 		Repo:   orderRepo,
@@ -206,7 +260,7 @@ func main() {
 	renewSubs := &subscriptions.RenewDueSubscriptions{
 		Graph:      graphClient,
 		Repo:       subsRepo,
-		Tokens:     tokens,
+		Tokens:     graphTokens,
 		TTL:        cfg.SubscriptionTTL,
 		RenewAhead: cfg.RenewAhead,
 		Now:        time.Now,
@@ -215,7 +269,7 @@ func main() {
 	sendDueCheckups := &checkups.SendDueCheckups{
 		Repo:   checkupRepo,
 		Mail:   graphClient,
-		Tokens: tokens,
+		Tokens: graphTokens,
 		Now:    time.Now,
 		Log:    log,
 	}
@@ -233,7 +287,8 @@ func main() {
 
 	e := httpctl.NewRouter(httpctl.RouterDeps{
 		Resolver:       staticResolver{user: seedUser},
-		Tokens:         tokens,
+		Tokens:         tokenSink,
+		Auth:           routerAuth,
 		AllowedOrigins: cfg.CORSOrigins,
 		Orders:         ordersController,
 		Subscriptions:  &httpctl.SubscriptionsController{Ensure: ensureSub, Log: log},
