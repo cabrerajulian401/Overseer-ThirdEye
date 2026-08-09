@@ -12,7 +12,7 @@
 
 - Spec: `docs/tech_spec_dashboard2.md` — field names, enums, and rules there are authoritative.
 - Layering never breaks: `controller / worker → usecase → gateway / repo`; ports live in the consuming usecase package; adapters never import usecases.
-- Every table carries `account_id` + `user_id`; every query filters by them from auth context.
+- Every table carries `tenant_id` + `user_id`; every query filters by them from auth context. (`accounts` renames to `tenants` in the first Dashboard-2 migration — Task 1; Go entities use `TenantID`. Auth **transport** is untouched in this plan — session-cookie auth per `In_Prog_Tech_Spec.md` lands in Plan 4.)
 - Casing: `PascalCase` Go, `snake_case` DB, `camelCase` JSON. Enums are typed strings matching DB `CHECK` constraints.
 - Breaking migrations allowed (no production data). Migrations are append-only numbered files in `overseer/db/migrations/`, DDL copied from the spec's Schema Updates.
 - Money is `float64` in Go / `NUMERIC(12,2)` in Postgres for this MVP (single user, display-centric; revisit if math compounds). Dates that are calendar dates use `*time.Time` + DATE columns.
@@ -27,9 +27,9 @@
 | **1 — Core Domain & Ingestion (this plan)** | Vendors + unknown senders · orders remodel (items/documents/timeline/stage) · legacy Otto retirement · LLM triage/extraction reshape · matching pipeline (`HandleChangeMessage`) · Needs Review · sync rebuild with progress · board API (`GET/PATCH /orders`, detail) · auto-archive worker · WS event additions | — |
 | **2 — Otto & Sheet Connections** | `extractions` queue + issues engine · workbooks + per-workbook mappings + `connections(sheet)` · deterministic mapped writes (excel gateway growth: ReadRows/UpdateRow/DeleteTableRow/CreateWorkbook/ListTabs) · accept/reject/restore/retry · pipeline + assign start creating extraction rows | 1 |
 | **3 — Checkups Remodel** | `checkups`/`checkup_orders`/`checkup_events` replace `checkup_messages` · 3 trigger types + send window + cap + awaiting_manual_check · reply detection in the pipeline · send/skip/coverage gaps · scheduler rework | 1 (2 for none) |
-| **4 — Audit, Contact List, Onboarding & Inbox Connection** | `flags` remodel + accept fan-out + dispute lifecycle (pauses checkups → needs 3) · impact/exposure/vendor patterns · Contact List endpoints · `/me` + profile/grants/tutorial + sync gating · `connections(inbox)` + backfill | 1, 2, 3 |
+| **4 — Audit, Contact List, Auth & Accounts, Inbox Connection** | `flags` remodel + accept fan-out + dispute lifecycle (pauses checkups → needs 3) · impact/exposure/vendor patterns · Contact List endpoints · session-cookie auth per `In_Prog_Tech_Spec.md` Flows A–D (login/callback/consent/logout, `user_logins`/`sessions`/`msal_token_cache`, `resolve_login`, `GetAccessToken(home_account_id)`, `needs_reconsent`, lifecycle webhook) · `/user/me` + onboarding + tutorial · consent-triggered sync · `connections(inbox)` + backfill | 1, 2, 3 |
 
-Plans 2–4 are written (full task detail, this format) after the preceding plan lands and is reviewed. Deliberate Plan-1 shims, resolved later: pipeline and Needs Review **assign** do not yet create extraction rows (Plan 2); board `atStake`/`openFlagCount`/`contested` return zero/false (Plan 4 remodels flags — the old `discrepancies` table keeps working behind a tiny type shim); `POST /sync` grant-gating lands with onboarding (Plan 4); `CancelPendingByConversation` reply-cancel survives untouched until Plan 3 replaces it.
+Plans 2–4 are written (full task detail, this format) after the preceding plan lands and is reviewed. Deliberate Plan-1 shims, resolved later: pipeline and Needs Review **assign** do not yet create extraction rows (Plan 2); board `atStake`/`openFlagCount`/`contested` return zero/false (Plan 4 remodels flags — the old `discrepancies` table keeps working behind a tiny type shim); `POST /sync` consent-gating (and consent-triggered auto-sync) lands with auth in Plan 4; `CancelPendingByConversation` reply-cancel survives untouched until Plan 3 replaces it.
 
 ---
 
@@ -44,7 +44,7 @@ Plans 2–4 are written (full task detail, this format) after the preceding plan
 
 **Interfaces:**
 - Consumes: `entity` conventions (uuid PKs, typed-string enums), `repo/db.go` pool.
-- Produces: `entity.Vendor{ID, AccountID, UserID uuid.UUID, VendorName, ContactName string, LastActivityDate *time.Time, CreatedAt, UpdatedAt time.Time}` · `entity.VendorEmail{ID, UserID, VendorID uuid.UUID, Email string, CreatedAt time.Time}` · `entity.UnknownSender{ID, AccountID, UserID uuid.UUID, Email string, MessageCount int, Status entity.UnknownSenderStatus, CreatedAt, UpdatedAt time.Time}` with `UnknownSenderStatus ∈ pending|attached|ignored` + `ValidUnknownSenderStatus(s) bool` · repo methods `CreateVendor`, `AttachEmail`, `GetVendorBySenderEmail(ctx, userID, email) (entity.Vendor, bool, error)`, `ListVendors`, `UpsertUnknownSender(ctx, s) error` (insert or `message_count+1`), `SetUnknownSenderStatus`.
+- Produces: `entity.Vendor{ID, TenantID, UserID uuid.UUID, VendorName, ContactName string, LastActivityDate *time.Time, CreatedAt, UpdatedAt time.Time}` · `entity.VendorEmail{ID, UserID, VendorID uuid.UUID, Email string, CreatedAt time.Time}` · `entity.UnknownSender{ID, TenantID, UserID uuid.UUID, Email string, MessageCount int, Status entity.UnknownSenderStatus, CreatedAt, UpdatedAt time.Time}` with `UnknownSenderStatus ∈ pending|attached|ignored` + `ValidUnknownSenderStatus(s) bool` · repo methods `CreateVendor`, `AttachEmail`, `GetVendorBySenderEmail(ctx, userID, email) (entity.Vendor, bool, error)`, `ListVendors`, `UpsertUnknownSender(ctx, s) error` (insert or `message_count+1`), `SetUnknownSenderStatus`.
 
 - [ ] **Step 1: Write the failing entity test**
 
@@ -100,7 +100,7 @@ func ValidUnknownSenderStatus(s UnknownSenderStatus) bool {
 
 type Vendor struct {
 	ID               uuid.UUID
-	AccountID        uuid.UUID
+	TenantID        uuid.UUID
 	UserID           uuid.UUID
 	VendorName       string
 	ContactName      string
@@ -119,7 +119,7 @@ type VendorEmail struct {
 
 type UnknownSender struct {
 	ID           uuid.UUID
-	AccountID    uuid.UUID
+	TenantID    uuid.UUID
 	UserID       uuid.UUID
 	Email        string
 	MessageCount int
@@ -133,7 +133,9 @@ type UnknownSender struct {
 
 Run: `go test ./internal/entity/ -run TestValidUnknownSenderStatus`
 
-- [ ] **Step 5: Write the migration** — copy the `vendors`, `vendor_emails`, `unknown_senders` DDL verbatim from `docs/tech_spec_dashboard2.md` → Schema Updates into `db/migrations/20260809000007_vendors.sql` with dbmate's `-- migrate:up` / `-- migrate:down` markers (down: `DROP TABLE unknown_senders; DROP TABLE vendor_emails; DROP TABLE vendors;`).
+- [ ] **Step 5: Write the migrations** — two files:
+    1. `db/migrations/20260809000006_tenants_rename.sql` — the spec's identity rename, schema part only: `ALTER TABLE accounts RENAME TO tenants;` + `RENAME COLUMN company_name TO name;` + `ADD COLUMN industry TEXT, ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT now();` + `ALTER TABLE users RENAME COLUMN account_id TO tenant_id;` + `ALTER TABLE users ALTER COLUMN tenant_id DROP NOT NULL;` (down reverses). The rest of the identity work (`user_logins`, `sessions`, `msal_token_cache`, session auth) is **Plan 4** — do not create those tables here. Update `repo/users.go` + `entity/account.go` (`Account` → `Tenant`, `TenantID` fields) so the build stays green.
+    2. `db/migrations/20260809000007_vendors.sql` — copy the `vendors`, `vendor_emails`, `unknown_senders` DDL verbatim from `docs/tech_spec_dashboard2.md` → Schema Updates, with dbmate's `-- migrate:up` / `-- migrate:down` markers (down: `DROP TABLE unknown_senders; DROP TABLE vendor_emails; DROP TABLE vendors;`).
 
 - [ ] **Step 6: Implement `repo/vendors.go`** — follow `repo/orders.go` style: `const` SQL + methods + row↔entity mapping. Queries: insert vendor; insert vendor_email; `SELECT v.* FROM vendors v JOIN vendor_emails e ON e.vendor_id = v.id WHERE e.user_id = $1 AND lower(e.email) = lower($2)` for `GetVendorBySenderEmail` (returns `found=false` on no rows, not an error); list by user ordered by `vendor_name`; `INSERT … ON CONFLICT (user_id, email) DO UPDATE SET message_count = unknown_senders.message_count + 1, updated_at = now()` for `UpsertUnknownSender`; status update.
 
@@ -157,7 +159,7 @@ git commit -m "feat: vendor identity spine — entities, schema, repo"
 
 **Interfaces:**
 - Consumes: Task 1 repo method signatures (declared here as ports).
-- Produces: `ResolveSender.Execute(ctx, userID, accountID uuid.UUID, email string) (entity.Vendor, bool, error)` — on miss, upserts the unknown-sender row and returns `found=false`. `CreateVendor.Execute(ctx, in CreateVendorInput{AccountID, UserID uuid.UUID, VendorName, ContactName, FirstEmail string}) (entity.Vendor, error)` — creating with an email that matches a pending unknown sender flips it to `attached`. `AttachEmail.Execute(ctx, userID uuid.UUID, vendorID uuid.UUID, email string) error`.
+- Produces: `ResolveSender.Execute(ctx, userID, tenantID uuid.UUID, email string) (entity.Vendor, bool, error)` — on miss, upserts the unknown-sender row and returns `found=false`. `CreateVendor.Execute(ctx, in CreateVendorInput{TenantID, UserID uuid.UUID, VendorName, ContactName, FirstEmail string}) (entity.Vendor, error)` — creating with an email that matches a pending unknown sender flips it to `attached`. `AttachEmail.Execute(ctx, userID uuid.UUID, vendorID uuid.UUID, email string) error`.
 
 - [ ] **Step 1: Write failing tests** (table-driven, hand stubs per repo pattern)
 
@@ -231,7 +233,7 @@ type OrderDocParsed struct{ Quantity *int; UnitPrice *float64; Total *float64; E
 type TimelineEntry struct{ ID, OrderID uuid.UUID; EntryDate time.Time; Kind TimelineKind; Text, Link string; CreatedAt time.Time }
 
 type Order struct {
-	ID, AccountID, UserID uuid.UUID
+	ID, TenantID, UserID uuid.UUID
 	VendorID              *uuid.UUID
 	OrderNumber           string // 'PO-2417' — business/matching key
 	ConversationID        string // primary thread; "" for manual orders
@@ -422,7 +424,7 @@ plus `entity.BoardStats{ActiveOrderCount int; TotalOpenValue float64; StalledOrd
 
 **Interfaces:**
 - Consumes: Task 5 order repo ports, Task 3 entities.
-- Produces: `ApplyMessageToOrder.Execute(ctx, in ApplyInput) (entity.Order, bool /*created*/, error)` with `ApplyInput{AccountID, UserID uuid.UUID; VendorID *uuid.UUID; Existing *entity.Order; X entity.OrderExtraction; Msg entity.EmailMessage; Today time.Time}`. Merge rules (unit-tested here, reused by sync + webhook + Plan-2 accept):
+- Produces: `ApplyMessageToOrder.Execute(ctx, in ApplyInput) (entity.Order, bool /*created*/, error)` with `ApplyInput{TenantID, UserID uuid.UUID; VendorID *uuid.UUID; Existing *entity.Order; X entity.OrderExtraction; Msg entity.EmailMessage; Today time.Time}`. Merge rules (unit-tested here, reused by sync + webhook + Plan-2 accept):
     - Existing order: items merged per extracted line — fill nil fields, overwrite non-nil ones; `Confirmed` snapshot rebuilt from items[0]; stage applied only through `CanApplyInferredStage`; `LastActivityDate` **only moves forward**; `IsNew = true`; `StatedTotal` set when extraction carries one; exactly one `email` timeline entry (text = `ActivitySummary`, link = `Msg.WebLink`).
     - No order: create at extracted stage (default `ordered`), `StageSource = auto_inferred`, `Requested` from the extraction, `Confirmed = nil`, one `email` timeline entry.
 
@@ -451,7 +453,7 @@ Write these as full table-driven tests in the file — each case builds an `Appl
 
 **Interfaces:**
 - Consumes: order repo ports (timeline append, GetByID, Create), vendors `CreateVendor`.
-- Produces: `entity.UnmatchedEmail{ID, AccountID, UserID uuid.UUID; MessageID, ConversationID, Sender, Subject string; ReceivedDate time.Time; SourceEmailLink string; Parsed entity.UnmatchedParse; Status entity.UnmatchedStatus; …}` with `UnmatchedStatus ∈ pending|assigned|converted|dismissed`, `UnmatchedParse{VendorName, ItemDescription string; Quantity *int; UnitPrice *float64}`; repo `Insert` (idempotent on `(user_id, message_id)` via `ON CONFLICT DO NOTHING`), `ListByStatus`, `GetByID`, `SetStatus`; usecases:
+- Produces: `entity.UnmatchedEmail{ID, TenantID, UserID uuid.UUID; MessageID, ConversationID, Sender, Subject string; ReceivedDate time.Time; SourceEmailLink string; Parsed entity.UnmatchedParse; Status entity.UnmatchedStatus; …}` with `UnmatchedStatus ∈ pending|assigned|converted|dismissed`, `UnmatchedParse{VendorName, ItemDescription string; Quantity *int; UnitPrice *float64}`; repo `Insert` (idempotent on `(user_id, message_id)` via `ON CONFLICT DO NOTHING`), `ListByStatus`, `GetByID`, `SetStatus`; usecases:
     - `AssignToOrder.Execute(ctx, userID uuid.UUID, id, orderID uuid.UUID, today time.Time) error` — timeline `email` entry dated `ReceivedDate` (but order `last_activity_date` only forward), status → `assigned`. (Extraction-row creation added in Plan 2 — leave a `// plan-2: queue extraction` marker.)
     - `CreateOrderFromEmail.Execute(ctx, in CreateFromEmailInput) (entity.Order, error)` — validates vendor+item+quantity; `ordered`/`manual_override`; `Requested` from draft; email = first timeline entry; status → `converted`; `NewVendorName` set → create vendor + attach sender.
     - `SetDismissed.Execute(ctx, userID, id uuid.UUID, dismissed bool) error` — `pending ↔ dismissed` only; `assigned`/`converted` are terminal → `entity.ErrIllegalTransition` (add alongside `ErrReauthRequired` in `entity/errors.go`).
@@ -497,7 +499,7 @@ Idempotency: duplicate Graph delivery of the same message must not double-insert
 
 **Interfaces:**
 - Consumes: triage/extract ports, `ApplyMessageToOrder`, vendors usecases, unmatched repo, sync-run repo (`Insert`, `SetProgress`, `Finish`).
-- Produces: `BuildActiveOrderList.Execute(ctx, in BuildInput{AccountID, UserID uuid.UUID; Token string; SyncID uuid.UUID; Since time.Time}) (int, error)` — per thread: triage latest message → extract → seed vendor by sender when new (auto-create with domain-derived name, mirroring the spec's "vendor inferred from sender domain") → apply → progress event every thread (`Pct = threadsDone*100/threadTotal`, `StatusLine` cycling the five spec lines); unmatched threads land in `unmatched_emails`; finishes `sync_runs` row + `sync.completed` (existing event, unchanged shape).
+- Produces: `BuildActiveOrderList.Execute(ctx, in BuildInput{TenantID, UserID uuid.UUID; Token string; SyncID uuid.UUID; Since time.Time}) (int, error)` — per thread: triage latest message → extract → seed vendor by sender when new (auto-create with domain-derived name, mirroring the spec's "vendor inferred from sender domain") → apply → progress event every thread (`Pct = threadsDone*100/threadTotal`, `StatusLine` cycling the five spec lines); unmatched threads land in `unmatched_emails`; finishes `sync_runs` row + `sync.completed` (existing event, unchanged shape).
 
 - [ ] **Step 1: Update the usecase test** — asserts: non-order threads skipped; orders + vendors + unmatched rows created; progress events published with monotonic `Pct`; LLM error aborts before any write (existing rule, keep the case); `sync_runs` row transitions running → completed.
 - [ ] **Step 2–4: Red → migration (DDL verbatim) + implement → green**; `go test ./...`

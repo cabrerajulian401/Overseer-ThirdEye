@@ -61,7 +61,7 @@ Specific
 ## **Non-goals**
 
 - *Billing / subscription (Free Beta / Pro, Stripe) — the build spec omits it entirely and the prototype only has static markup for it. Deferred; the `Account` surface ships profile + tutorial + sign-out only.*
-- *Multi-tenant, roles/permissions, mobile — build spec scope: single user, desktop-first (~1280px target, 1024px floor).*
+- *Multi-tenant UI, roles/permissions, mobile — build spec scope: single user per tenant, desktop-first (~1280px target, 1024px floor). The accounts **schema** is multi-tenant-ready (`tenants` → `users`, 100–1000 users at full scale per `In_Prog_Tech_Spec.md`); only the UI/permissions model is single-user.*
 - *Backward compatibility with the Loki add-in — Dashboard 2 replaces it; old enums and endpoints may break.*
 - *The dashboard frontend itself — this repo is the Overseer backend; the dashboard is a new client consuming this API (same rule as the add-in: any client uses the same API + `/ws`).*
 - *Microservices, unneeded complexity, optimizing past the first working solution.*
@@ -78,7 +78,7 @@ What the backend implements today (verified against `overseer/` on branch `Dashb
 | Otto | User-initiated scan (`POST /otto/scans`) → LLM ranks destinations → LLM plans append → Excel write | **[CHANGE]** Pipeline-fed extraction queue, issues engine (3 blocking + 3 warning), per-extraction destination, per-workbook column mappings, deterministic mapped writes, insert-vs-update with write-time row re-check, sync error/retry, reject with undo + synced-row removal |
 | Checkups | One row per precomputed message; cadence only; statuses `pending/paused/sending/sent/cancelled`; reply cancels via `cancel_if_reply` | **[CHANGE]** Rule entity with 3 trigger types, send window, multi-PO coverage, send cap (2) + `awaiting_manual_check`, reply detection resets counter, dispute pause/resume, per-checkup history, coverage gaps |
 | Audit | `discrepancies` with `open/resolved/dismissed`, priority, `price/date/unit` detail; found on webhook path | **[CHANGE]** Full flag lifecycle `new/accepted/disputed/resolved/dismissed`, type vocabulary `price/quantity/date/document_mismatch/other`, accept fan-out (order + doc + timeline + Otto row), 3-step dispute with checkup pausing, impact/exposure math, vendor pattern, notes, recoverable dismissals |
-| Auth & onboarding | `AUTH_MODE=mvp\|aad`; AAD JWT validation + OBO exchange; seeded single user; `POST /sync` (202) | **[CHANGE]** User keyed on `aad_oid` (returning-account check), profile fields, grant state (`Mail.ReadWrite`, `Files.ReadWrite`) gating sync, sync progress reporting, tutorial state |
+| Auth & onboarding | `AUTH_MODE=mvp\|aad`; bearer AAD JWT validation + OBO exchange; seeded single user; `POST /sync` (202) | **[CHANGE]** Session-cookie auth via the MSAL auth-code flow (`In_Prog_Tech_Spec.md` Flows A–D is the source of truth): login/callback/consent/logout, `resolve_login` on `user_logins`, persisted encrypted token cache keyed `home_account_id`, `needs_reconsent` + Reconnect, tenant + profile onboarding, sync triggered by consent, lifecycle webhook, sync progress, tutorial state |
 | Settings/Connections | Nothing (sheet chosen per scan; no connection state) | **[NEW]** Inbox + sheet connection state, disconnect/reconnect with backfill, workbook registry + per-workbook column mapping wizard, create-tracking-sheet path |
 | Realtime | `/ws` hub broadcasting `order.updated`, `discrepancy.found`, `sync.completed` | **[CHANGE]** Event set grows (extraction, needs-review, checkup, flag, sync progress, connection); envelope unchanged |
 | Workers | 1-min checkup ticker + 1-h subscription-renewal ticker as `main.go` goroutines | **[CHANGE]** Checkup tick evaluates trigger rules; **[NEW]** daily auto-archive job; webhook job becomes the matching pipeline |
@@ -105,7 +105,11 @@ No. With explicit per-workbook column mappings, the mapped write is **determinis
 
 - [Auth] How does the account chooser know an identity "already has ThirdEye"?
 
-Keyed on the AAD object id (`oid`), not email. The AAD validator already surfaces `oid` in claims; users gain an `aad_oid` column, and first authenticated call resolves returning-vs-new. (The chooser UI itself is Microsoft's; the backend's job is answering the question after token exchange and resuming abandoned onboarding.)
+The chooser UI is Microsoft's; the backend decides new-vs-returning at `GET /auth/callback`. Per `In_Prog_Tech_Spec.md` (source of truth): `ExchangeCode(code)` → ID-token claims → `resolve_login` runs **one atomic upsert on `user_logins (provider, provider_user_id = oid)`** and returns `NewUser | ResumeOnboarding (tenant_id NULL) | Returning`. Existence is checked on `user_logins`, never on `users.email`; signup is the first login's side effect.
+
+- [Auth] The repo already has a bearer-token AAD mode (`gateway/aad`, OBO) — does the dashboard use it?
+
+No. `In_Prog_Tech_Spec.md` specifies the dashboard's transport: MSAL **auth-code flow** with httpOnly **session cookies**, a server-side **encrypted MSAL token cache** (keyed `home_account_id`), and `GetAccessToken(home_account_id)` for every background Graph call. The existing `gateway/aad` claim-validation code is reused where it fits inside the new `msal` gateway, but bearer-per-request auth and OBO exchange are not the dashboard surface.
 
 - [Connections] What is the "queued emails" count while the inbox is down?
 
@@ -121,7 +125,7 @@ Best-effort. If the Graph token is still valid but the subscription lapsed, a de
 
 ### API Conventions (applies to everything below)
 
-- **[EXISTS]** REST, resource-oriented URLs; server mints all IDs; `userId`/`accountId` from auth context, never the body; `camelCase` JSON / `snake_case` DB / `PascalCase` Go.
+- **[CHANGE]** REST, resource-oriented URLs; server mints all IDs; `userId`/`tenantId` from auth context — which is now the **session** (httpOnly cookie), never the body and never a bearer header; `camelCase` JSON / `snake_case` DB / `PascalCase` Go.
 - **[EXISTS]** One realtime channel: `GET /ws` pushes `{ "type": ..., "data": {...} }`. New features add event **types**, never new sockets. Full event inventory in Cross-Cutting Rules below.
 - **[EXISTS]** Long work is async: `202 { id }` + completion over `/ws` (initial sync already works this way; sheet writes stay synchronous — they're one Graph call).
 - **[NEW]** **Sub-action POSTs** follow the existing `/otto/scans/{id}/record` precedent: state-machine transitions that carry semantics beyond a field patch (`/accept`, `/reject`, `/restore`, `/dispute`) are `POST /resource/{id}/<action>`. Plain field edits stay `PATCH`.
@@ -181,7 +185,7 @@ The board is the read model; ingestion is the write model. Sync seeds it once **
 ### `POST controller/sync` — **[CHANGE]**
 
 - Keeps the async contract: `202 { syncId }`, runs the backfill job. Changes:
-    - Gated on onboarding: rejected with `409` until both grants are recorded (`grantMail`, `grantFiles`) — "Sync cannot start until both are granted."
+    - Gated on consent: rejected with `409` until `consented_at` is recorded on the login — and normally not called by the client at all, since the consent callback (`GET /auth/consent`) enqueues the initial sync job itself. The endpoint remains for manual re-sync.
     - Writes a `sync_runs` row and pushes **[NEW]** `sync.progress` events (`{ syncId, pct, statusLine }`) so the five-line progress UI is real; finishes with the existing `sync.completed`.
     - Seeds **vendors** (from sender addresses + LLM vendor names), **orders** (multi-line, via the matching pipeline below), **extractions** (one per order-bearing email, `pending_review`), and **unmatched_emails** — the board appears fully populated, which is the onboarding contract (no skeleton).
 
@@ -421,17 +425,43 @@ Today: `discrepancies` rows (`open/resolved/dismissed`) found on the webhook pat
 
 # Onboarding & Account
 
-Auth transport **[EXISTS]**: `AUTH_MODE=aad` already validates AAD JWTs (JWKS, `oid`/`tid`/`scp` checks), performs OBO exchange for Graph tokens, and handles `interaction_required` re-auth (`403`). What's missing is the **product state around it** — today every request resolves to one seeded user.
+**Source of truth: `docs/In_Prog_Tech_Spec.md` (Flows A–D).** The dashboard authenticates with **httpOnly session cookies**; Graph tokens come from a **persisted, encrypted MSAL confidential-client cache** — never from request bearers. The existing `AUTH_MODE=aad` bearer/OBO stack **[CHANGE]** is reworked into this model (its JWKS/claims validation is reused inside the new gateway; bearer-per-request and OBO are not the dashboard surface).
 
-### `GET controller/me` — **[NEW]**
+### `GET controller/auth/login` / `GET controller/auth/callback` / `POST controller/auth/logout` — **[NEW]** (Flow A)
 
-- The session bootstrap: `{ profile: { firstName, lastName, businessName, industry, phoneNumber }, returning, onboarding: { profileDone, grantMail, grantFiles, syncDone }, tutorial: { step, done } }`. First authenticated call upserts the user by `aad_oid` — this is the "already has ThirdEye" answer and the abandoned-onboarding resume point. Returning users: profile prefilled, grants assumed, tutorial marked done.
+- **Login**: build the authorize URL (scopes `Mail.Read`, `Mail.Send`, `Files.ReadWrite`, `User.Read`, `offline_access`), set the short-lived httpOnly `oauth_state` cookie, 302 to `login.microsoftonline.com/common` (work + personal accounts).
+- **Callback**: reject `?error=` (declined consent); verify `state` (constant-time, one-time, cookie cleared); `msal.ExchangeCode(code)` → access + refresh + ID tokens land in the MSAL cache, whose cache-accessor Export saves the **encrypted blob** via the token-cache repo keyed `home_account_id`; ID-token claims (`oid`, `tid`, `email`, `name`) → `usecase/auth/ResolveLogin`: **one atomic upsert on `user_logins (provider, provider_user_id)`** — row exists → touch `last_login_at`, refresh email/name; no row → insert `users` + `user_logins` in one tx. Outcome routes the redirect: `NewUser`/`ResumeOnboarding` (`tenant_id NULL`) → `/onboarding/profile` · `Returning` → `/dashboard`. Issue session (server-side `sessions` row + httpOnly cookie).
+- **Logout**: delete the session row, clear the cookie. Offboarding variant also deletes the subscription + token-cache rows.
 
-### `PATCH controller/me` — **[NEW]**
+### `POST controller/account/onboarding` — **[NEW]** (Step 2)
 
-- Profile fields (Step 2), `tutorial` state (advance / finish / **replay** resets), and grant recording (Step 3: the client reports consent outcomes; the backend verifies scopes off the token where possible). Both grants required before `POST /sync` unlocks.
+- One tx: create `tenants` row (`name` = business name, `industry`) + fill user profile (`first_name`, `last_name`, `phone_number`) + set `users.tenant_id`. Identity fields never come from the client — they came from the token exchange.
 
-### `usecase/account/GetMe` / `UpdateProfile` / `RecordGrants` / `SetTutorial` — **[NEW]** · `repo/users` — **[CHANGE]** (upsert-by-oid, profile/grant/tutorial columns)
+### `GET controller/auth/consent` — **[NEW]** (Step 3 — new users only, after profile)
+
+- Second authorize redirect with the full scope set — **this consent is what yields the refresh token**. The same callback handles the return (`state` carries `intent: consent`); records `consented_at` on the login; **triggers `job/CreateMailSubscription` + the initial sync job** (sync is consent-triggered, not a separate gate). Reused by Settings → Reconnect when `needs_reconsent = true`. Returning users never hit this.
+
+### `GET controller/user/me` / `PATCH controller/user/me` — **[NEW]** (Flow B)
+
+- `GET`: `{ userId, email, displayName, needsReconsent, onboarding: { profileDone, consented }, tutorial: { step, done } }` — `needsReconsent` is how the FE learns a background refresh token died (Flow C sets it; Reconnect clears it). Tutorial state is dashboard state kept from the prototype (the auth spec is silent on it).
+- `PATCH`: profile edits (`firstName`, `lastName`, `phoneNumber` — `businessName`/`industry` live on the **tenant**) + tutorial advance / finish / replay.
+
+### `middleware/session` — **[NEW]** · `/ws` auth — **[CHANGE]**
+
+- Session middleware validates the cookie → loads the user into context → 401 otherwise. Dashboard reads are **session + DB only** — no Graph call on the read path (Flow B). `/ws` validates the session at upgrade and scopes pushes to the user's own topic (today's hub broadcasts every event to every client).
+
+### `usecase/token/GetAccessToken(homeAccountID)` — **[CHANGE]** (replaces the aad `Manager` for background work)
+
+- The auth black box every worker calls: MSAL silent acquire → refresh → rotated cache re-saved to the repo. On interaction-required: set `needs_reconsent = true` on the login and stop — workers skip that user; `GET /user/me` surfaces the flag.
+
+### Subscription lifecycle — **[CHANGE]**
+
+- Webhook guard order (Flow C): `validationToken` echo → loop `value[]` (batched) → drop entries whose `clientState` mismatches → map `subscription_id → home_account_id` → enqueue → 200 fast. The notification is a poke, not a payload — content is always re-fetched with our own token.
+- `job/CreateMailSubscription` (consent-triggered): resource `/me/mailFolders('inbox')/messages`, `expirationDateTime ≈ now + 4200 min`, both `notificationUrl` and **`lifecycleNotificationUrl`** set; one active subscription per user (idempotent).
+- `job/RenewSubscriptions` (~12h cron): renew subs expiring within 24h via `PATCH /subscriptions/{id}`; on 404/failure delete + recreate; dead token → flag `needs_reconsent`, skip. (Today: 1h ticker, 48h TTL, no lifecycle endpoint.)
+- `POST controller/webhooks/graph/lifecycle` — **[NEW]**: `reauthorizationRequired` → renew now · `subscriptionRemoved` → recreate · missed notifications → trigger resync.
+
+### `usecase/auth/ResolveLogin` / `HandleCallback` / `RecordConsent` / `Logout` · `usecase/account/CompleteOnboarding` / `GetMe` / `SetTutorial` — **[NEW]** · gateway `msal` — **[CHANGE]** (evolves `gateway/aad`: keeps claims validation; adds confidential-client `ExchangeCode`, silent acquire, cache accessor) · `repo/users` — **[CHANGE]** · `repo/user_logins`, `repo/sessions`, `repo/token_cache` — **[NEW]**
 
 - Subscription/billing: **out of scope** (Non-goals). The Account screen's security section is display-only (Microsoft's domain).
 
@@ -445,7 +475,7 @@ Auth transport **[EXISTS]**: `AUTH_MODE=aad` already validates AAD JWTs (JWKS, `
 
 ### `DELETE controller/connections/{inbox|sheet}` / `POST controller/connections/inbox` — **[NEW]**
 
-- Disconnect (client confirms) → banners; **inbox down**: webhook processing pauses (subscription dropped); **sheet down**: Otto accepts are blocked (`sheet_disconnected` issue). Reconnect inbox → re-subscribe + **backfill job** processes mail since `disconnected_at` through the normal pipeline, then reports the count.
+- Disconnect (client confirms) → banners; **inbox down**: webhook processing pauses (subscription dropped); **sheet down**: Otto accepts are blocked (`sheet_disconnected` issue). Reconnect inbox → if `needs_reconsent`, run the Reconnect flow (`GET /auth/consent`) first; then re-subscribe + **backfill job** processes mail since `disconnected_at` through the normal pipeline, then reports the count.
 
 ### `POST controller/connections/sheet` — **[NEW]**
 
@@ -467,27 +497,67 @@ Auth transport **[EXISTS]**: `AUTH_MODE=aad` already validates AAD JWTs (JWKS, `
 
 **Dependencies**
 
-- **Microsoft Graph** — mail read/send, change notifications **[EXISTS]**; attachments (documents/OCR) **[NEW]**; OneDrive search **[EXISTS]**; Excel: append **[EXISTS]**, read/update/delete rows + create workbook **[NEW]**. Scopes: `Mail.ReadWrite`, `Files.ReadWrite` (recorded per user at onboarding).
-- **AAD** — validation + OBO **[EXISTS]**; user-by-`oid` upsert **[NEW]**.
+- **Microsoft Graph** — mail read/send, change notifications **[EXISTS]**; lifecycle notifications **[NEW]**; attachments (documents/OCR) **[NEW]**; OneDrive search **[EXISTS]**; Excel: append **[EXISTS]**, read/update/delete rows + create workbook **[NEW]**. Scopes (one consent at onboarding Step 3, per `In_Prog_Tech_Spec.md`): `Mail.Read`, `Mail.Send`, `Files.ReadWrite`, `User.Read`, `offline_access`.
+- **Microsoft identity (MSAL)** — auth-code + refresh flow, session cookies, persisted encrypted token cache **[CHANGE]** (evolves the existing `gateway/aad` bearer/OBO stack); `user_logins` upsert **[NEW]**.
 - **LLM provider** — behind `gateway/llm` as always; method set per the LLM Gateway section.
 - **Build order that de-risks fastest**: ① schema + vendors + order remodel (everything reads it) → ② matching pipeline + Needs Review (the board fills itself — the product's core claim) → ③ Otto queue + mappings + writes → ④ Checkups remodel → ⑤ Audit lifecycle → ⑥ Onboarding/Connections polish. Each step keeps `go test ./...` green with the existing two-tier test strategy (usecase unit tests + controller E2E over fakes).
 
 ## **Schema Updates**
 
-Conventions unchanged: Postgres, `snake_case`, every table carries `account_id` + `user_id`, every query filters on them from auth context. Breaking migrations are allowed (no production data); each remodel below is a new numbered dbmate migration in `overseer/db/migrations/`.
+Conventions: Postgres, `snake_case`, every table carries `tenant_id` + `user_id` (the tenants rename below ships first), every query filters on them from auth context. Breaking migrations are allowed (no production data); each remodel below is a new numbered dbmate migration in `overseer/db/migrations/`.
 
-**[CHANGE]** `users` — add identity, profile, grants, tutorial:
+**[CHANGE]** Identity & accounts — per `In_Prog_Tech_Spec.md` (source of truth). `accounts` remodels to `tenants`; identity moves to `user_logins`; sessions and the MSAL token cache get tables:
 
 ```sql
+ALTER TABLE accounts RENAME TO tenants;
+ALTER TABLE tenants RENAME COLUMN company_name TO name;
+ALTER TABLE tenants ADD COLUMN industry TEXT,
+                    ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- every domain table references tenants(id) via tenant_id; this rename ships as the FIRST
+-- Dashboard-2 migration so all new domain tables below can use tenant_id from day one
+
 ALTER TABLE users
-    ADD COLUMN aad_oid        TEXT UNIQUE,              -- returning-account key (chooser answer)
-    ADD COLUMN first_name     TEXT, ADD COLUMN last_name TEXT,
-    ADD COLUMN business_name  TEXT, ADD COLUMN industry  TEXT, ADD COLUMN phone_number TEXT,
-    ADD COLUMN grant_mail     BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN grant_files    BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN tutorial_step  INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN tutorial_done  BOOLEAN NOT NULL DEFAULT false;
--- graph_refresh_token_enc is dead in both auth modes today; drop it when convenient
+    RENAME COLUMN account_id TO tenant_id;
+ALTER TABLE users
+    ALTER COLUMN tenant_id DROP NOT NULL,               -- NULL until onboarding Step 2 = ResumeOnboarding marker
+    ADD COLUMN display_name  TEXT,
+    ADD COLUMN first_name    TEXT, ADD COLUMN last_name TEXT, ADD COLUMN phone_number TEXT,
+    ADD COLUMN is_active     BOOLEAN NOT NULL DEFAULT true,
+    ADD COLUMN tutorial_step INTEGER NOT NULL DEFAULT 0,   -- dashboard state (prototype), not in auth spec
+    ADD COLUMN tutorial_done BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    DROP COLUMN graph_refresh_token_enc;                -- tokens live in the encrypted MSAL cache below
+
+CREATE TABLE user_logins (                   -- a WAY OF SIGNING IN (1 user : N logins)
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider           TEXT NOT NULL,              -- 'entra' (later: 'external_id', 'google')
+    provider_user_id   TEXT NOT NULL,              -- oid for Entra; sub for others
+    provider_tenant_id TEXT,                       -- tid (Entra-specific, null elsewhere)
+    home_account_id    TEXT UNIQUE,                -- Entra-specific routing key (token cache + webhooks)
+    needs_reconsent    BOOLEAN NOT NULL DEFAULT false,
+    consented_at       TIMESTAMPTZ,                -- Step-3 full-scope consent (auth spec records it here)
+    last_login_at      TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (provider, provider_user_id)            -- THE identity key
+);
+
+CREATE TABLE sessions (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- opaque id carried by the httpOnly cookie
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);                                                          -- logout = DELETE row
+
+CREATE TABLE msal_token_cache (
+    home_account_id TEXT PRIMARY KEY,
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    cache_blob_enc  BYTEA NOT NULL,                -- encrypted MSAL cache export (holds the refresh token)
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE graph_subscriptions
+    ADD COLUMN home_account_id TEXT;               -- webhook guard: subscription_id → home_account_id → token
 ```
 
 **[NEW]** Vendors — the identity spine:
@@ -495,7 +565,7 @@ ALTER TABLE users
 ```sql
 CREATE TABLE vendors (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id         UUID NOT NULL REFERENCES accounts(id),
+    tenant_id          UUID NOT NULL REFERENCES tenants(id),
     user_id            UUID NOT NULL REFERENCES users(id),
     vendor_name        TEXT NOT NULL,
     contact_name       TEXT,
@@ -516,7 +586,7 @@ CREATE UNIQUE INDEX idx_vendor_emails_lookup ON vendor_emails (user_id, lower(em
 
 CREATE TABLE unknown_senders (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id    UUID NOT NULL REFERENCES accounts(id),
+    tenant_id     UUID NOT NULL REFERENCES tenants(id),
     user_id       UUID NOT NULL REFERENCES users(id),
     email         TEXT NOT NULL,
     message_count INTEGER NOT NULL DEFAULT 1,
@@ -532,7 +602,7 @@ CREATE TABLE unknown_senders (
 ```sql
 CREATE TABLE orders (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id            UUID NOT NULL REFERENCES accounts(id),
+    tenant_id             UUID NOT NULL REFERENCES tenants(id),
     user_id               UUID NOT NULL REFERENCES users(id),
     vendor_id             UUID REFERENCES vendors(id),
     order_number          TEXT NOT NULL,                 -- 'PO-2417' — business/matching key (was INTEGER)
@@ -602,7 +672,7 @@ CREATE INDEX idx_timeline_order ON order_timeline (order_id, entry_date DESC);
 ```sql
 CREATE TABLE unmatched_emails (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id           UUID NOT NULL REFERENCES accounts(id),
+    tenant_id            UUID NOT NULL REFERENCES tenants(id),
     user_id              UUID NOT NULL REFERENCES users(id),
     message_id           TEXT NOT NULL,
     conversation_id      TEXT,
@@ -624,7 +694,7 @@ CREATE TABLE unmatched_emails (
 ```sql
 CREATE TABLE extractions (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id           UUID NOT NULL REFERENCES accounts(id),
+    tenant_id            UUID NOT NULL REFERENCES tenants(id),
     user_id              UUID NOT NULL REFERENCES users(id),
     message_id           TEXT,
     conversation_id      TEXT,
@@ -664,7 +734,7 @@ CREATE INDEX idx_extractions_queue ON extractions (user_id, extraction_status);
 ```sql
 CREATE TABLE workbooks (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id    UUID NOT NULL REFERENCES accounts(id),
+    tenant_id     UUID NOT NULL REFERENCES tenants(id),
     user_id       UUID NOT NULL REFERENCES users(id),
     drive_item_id TEXT NOT NULL,
     filename      TEXT NOT NULL,
@@ -690,7 +760,7 @@ CREATE TABLE workbook_mappings (                         -- absence of a row = t
 
 CREATE TABLE connections (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id      UUID NOT NULL REFERENCES accounts(id),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id),
     user_id         UUID NOT NULL REFERENCES users(id),
     kind            TEXT NOT NULL CHECK (kind IN ('inbox','sheet')),
     status          TEXT NOT NULL DEFAULT 'connected' CHECK (status IN ('connected','disconnected')),
@@ -707,7 +777,7 @@ CREATE TABLE connections (
 ```sql
 CREATE TABLE checkups (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id          UUID NOT NULL REFERENCES accounts(id),
+    tenant_id           UUID NOT NULL REFERENCES tenants(id),
     user_id             UUID NOT NULL REFERENCES users(id),
     vendor_id           UUID NOT NULL REFERENCES vendors(id),
     message_template    TEXT NOT NULL,
@@ -751,7 +821,7 @@ CREATE TABLE checkup_events (                            -- per-checkup history 
 ```sql
 CREATE TABLE flags (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id         UUID NOT NULL REFERENCES accounts(id),
+    tenant_id          UUID NOT NULL REFERENCES tenants(id),
     user_id            UUID NOT NULL REFERENCES users(id),
     order_id           UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
     vendor_id          UUID REFERENCES vendors(id),
@@ -782,7 +852,7 @@ CREATE INDEX idx_flags_order ON flags (order_id);
 ```sql
 CREATE TABLE sync_runs (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id          UUID NOT NULL REFERENCES accounts(id),
+    tenant_id           UUID NOT NULL REFERENCES tenants(id),
     user_id             UUID NOT NULL REFERENCES users(id),
     status              TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','completed','failed')),
     progress_pct        INTEGER NOT NULL DEFAULT 0,
