@@ -1,5 +1,10 @@
 # Overseer
 
+Third Eye was a Startup I built over the summer, Scout was the main product we were selling. It ultimately failed, but I learned how to architect production systems and what B2B customers in procurement care about. 
+
+Learn more:
+https://thirdeye.tools/
+
 **Overseer** is the backend server behind **Scout** — ThirdEye's AI assistant for purchasing teams at wholesale distributors.
 
 The problem it solves: when you buy from suppliers, everything about your orders — confirmations, delays, price changes — lives buried in email threads. Overseer reads those emails (through Microsoft Graph), understands them (with Claude), and turns them into three things the operator sees right inside Outlook:
