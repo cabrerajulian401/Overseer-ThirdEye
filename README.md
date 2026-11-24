@@ -1,6 +1,6 @@
 # Overseer
 
-Third Eye was a Startup I built over the summer, Scout was the main product we were selling. It ultimately failed, but I learned how to architect production systems and what B2B customers in procurement care about. 
+ThirdEye was a startup I built over the summer, Scout was the main product we were selling. It ultimately failed, but I learned how to architect production systems and what B2B customers in procurement care about. 
 
 Learn more:
 https://thirdeye.tools/
